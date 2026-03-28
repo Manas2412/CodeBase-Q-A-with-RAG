@@ -1,6 +1,6 @@
 import pgvector.sqlalchemy as Vector
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy import String, Integer, DateTime, func
+from sqlalchemy import String, DateTime, func
 import uuid
 
 

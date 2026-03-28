@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterator
 import tree_sitter_python as tspython
 import tree_spitter_javascript as tsjavascript

@@ -1,5 +1,5 @@
 # app/db/models.py
-from sqlalchemy import String, Integer, DateTime, Text, func, ForeignKey
+from sqlalchemy import String, Integer, DateTime, Text, func, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from pgvector.sqlalchemy import Vector
 from app.db.database import Base
@@ -29,10 +29,10 @@ class Chunk(Base):
     end_line:       Mapped[int]       = mapped_column(Integer)
     content:        Mapped[str]       = mapped_column(Text, nullable=False)
     context_prefix: Mapped[str]       = mapped_column(Text, nullable=False)
-    embedding:      Mapped[list[float]] = mapped_column(Vector(1024), nullable=True)
+    embedding:      Mapped[list[float]] = mapped_column(Vector(1536), nullable=True)
     created_at:     Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     __table_args__ = (
-        # unique constraint so ON CONFLICT upsert works in indexer.py
+        UniqueConstraint("repo_id", "file_path", "start_line", name="uq_chunk_location"),
         {"schema": None},
     )

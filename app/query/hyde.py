@@ -1,6 +1,6 @@
 import httpx 
 
-PLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "codellama:7b"
 
 async def hyde_expand(query:str) -> str:
@@ -17,6 +17,7 @@ async def hyde_expand(query:str) -> str:
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             response = await client.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
                 json={
                     "model": OLLAMA_MODEL,
                     "prompt": prompt,

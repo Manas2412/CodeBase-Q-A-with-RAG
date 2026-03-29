@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Iterator
 import tree_sitter_python as tspython
-import tree_spitter_javascript as tsjavascript
+import tree_sitter_javascript as tsjavascript
 from tree_sitter import Language, Parser, Node
 
 PY_LANGUAGE = Language(tspython.language())
@@ -43,10 +43,10 @@ def _node_name(node: Node, source: bytes) -> str | None:
 
 
 def _build_prefix(
-    file_path: str, parent_name: str | Node, node_name: str | None
+    file_path: str, parent_name: str | Node | None, node_name: str | None
 ) -> str:
     parts = [file_path]
-    if parent_name:
+    if parent_name and isinstance(parent_name, str):
         parts.append(parent_name)
     if node_name:
         parts.append(node_name)
@@ -66,7 +66,7 @@ def _walk(
     if node.type in target_types:
         name = _node_name(node, source)
         chunk_type = "class" if "class" in node.type else "function"
-        content = source = source[node.start_byte : node.end_byte].decode(
+        content = source[node.start_byte : node.end_byte].decode(
             "utf-8", errors="replace"
         )
 
@@ -84,8 +84,9 @@ def _walk(
             )
 
         # Recurse into class bodies - methods become their own chunks
-        for child in node.children:
-            yield from _walk(child, source, file_path, language, parent_name=name)
+        if chunk_type == "class":
+            for child in node.children:
+                yield from _walk(child, source, file_path, language, parent_name=name)
 
     else:
         for child in node.children:
@@ -96,20 +97,20 @@ def _walk(
 
 def chunk_file(file_path: str, source_code: str, language: str) -> list[CodeChunk]:
     parser = get_parser(language)
-    source_bytes = source_code.encode()
+    source_bytes = source_code.encode("utf-8")
     tree = parser.parse(source_bytes)
     chunks = list(_walk(tree.root_node, source_bytes, file_path, language))
 
-    ## Fallback: if ATS yields nothing, treat whole file as one module
+    ## Fallback: if AST yields nothing, treat whole file as one module
     if not chunks and len(source_code.strip()) > 0:
         chunks = [
             CodeChunk(
-                nontent=source_code,
+                content=source_code,
                 context_prefix=file_path,
                 file_path=file_path,
                 language=language,
                 chunk_type="module",
-                name=Node,
+                name="module",
                 start_line=0,
                 end_line=source_code.count("\n"),
             )

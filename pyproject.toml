@@ -21,3 +21,8 @@ celery = {extras = ["redis"], version = "^5.4"}
 redis = {extras = ["asyncio"], version = "^5.0"}
 ragas = "^0.1"
 pydantic-settings = "^2.3"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]

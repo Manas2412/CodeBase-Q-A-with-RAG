@@ -1,5 +1,8 @@
 import voyageai
 from app.ingestion.chunker import CodeChunk
+from dotenv import load_dotenv
+
+load_dotenv()
 
 client = voyageai.AsyncClient()
 

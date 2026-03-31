@@ -10,7 +10,6 @@ from app.ingestion.chunker import chunk_file
 from app.ingestion.embedder import embed_chunks
 from app.ingestion.indexer import upsert_chunks
 
-
 load_dotenv()
 
 celery = Celery(
@@ -19,6 +18,10 @@ celery = Celery(
     backend=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
 )
 
+def get_dsn():
+    raw_url = os.getenv("DATABASE_URL", "")
+    db_url = raw_url.replace("postgresql+asyncpg://", "postgresql://").replace("postgres://", "postgresql://")
+    return db_url.split("?")[0]
 
 @celery.task(bind=True, max_retries=3, default_retry_delay=10)
 def index_repo_task(self, repo_id: str, github_url: str):
@@ -29,33 +32,29 @@ def index_repo_task(self, repo_id: str, github_url: str):
 
 
 async def _index_repo(repo_id: str, github_url: str):
-    # Fix: asyncpg.connect (not coonect); ssl=True not ssl="required"
-    conn = await asyncpg.connect(
-        dsn=os.getenv("DATABASE_URL"),
-        ssl=True,
-    )
-
-    await register_vector(conn)
-
+    conn = None
+    repo_path = None
     try:
+        dsn = get_dsn()
+        conn = await asyncpg.connect(dsn=dsn, ssl=True)
+        await register_vector(conn)
+
         # Mark as indexing
         await conn.execute(
             "UPDATE repos SET status = 'indexing' WHERE id = $1::uuid", repo_id
         )
 
         repo_path = await clone_repo(github_url)
-        try:
-            all_chunks = []
-            for file_path, source, language in walk_code_files(repo_path):
-                chunks = chunk_file(file_path, source, language)
-                all_chunks.extend(chunks)
+        
+        all_chunks = []
+        for file_path, source, language in walk_code_files(repo_path):
+            chunks = chunk_file(file_path, source, language)
+            all_chunks.extend(chunks)
 
-            print(f"[indexer] {len(all_chunks)} chunks from {github_url}")
+        print(f"[indexer] {len(all_chunks)} chunks from {github_url}")
 
-            embeddings = await embed_chunks(all_chunks)
-            await upsert_chunks(conn, repo_id, all_chunks, embeddings)
-        finally:
-            cleanup_repo(repo_path)  # always delete temp clone
+        embeddings = await embed_chunks(all_chunks)
+        await upsert_chunks(conn, repo_id, all_chunks, embeddings)
 
         await conn.execute(
             """
@@ -68,12 +67,15 @@ async def _index_repo(repo_id: str, github_url: str):
         print(f"[indexer] done - repo {repo_id} is ready")
 
     except Exception as e:
-        # Fix: SQL typo WHER -> WHERE
-        await conn.execute(
-            "UPDATE repos SET status = 'error' WHERE id = $1::uuid", repo_id
-        )
-        raise
+        print(f"[indexer] error indexing {github_url}: {e}")
+        if conn:
+            await conn.execute(
+                "UPDATE repos SET status = 'error' WHERE id = $1::uuid", repo_id
+            )
+        raise e
 
     finally:
-        cleanup_repo(repo_path)
-        await conn.close()
+        if repo_path:
+            cleanup_repo(repo_path)
+        if conn:
+            await conn.close()

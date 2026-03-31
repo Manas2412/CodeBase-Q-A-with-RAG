@@ -1,10 +1,13 @@
+import os
 import voyageai
 from app.ingestion.chunker import CodeChunk
 from dotenv import load_dotenv
 
 load_dotenv()
 
-client = voyageai.AsyncClient()
+# Use the same client initialization pattern as the retriever.
+# This prevents embedding calls from failing due to missing/implicit credentials.
+client = voyageai.AsyncClient(api_key=os.getenv("VOYAGE_API_KEY"))
 
 async def embed_chunks(chunks: list[CodeChunk]) -> list[list[float]]:
     """Embed a list of code chunks using Voyage AI"""
@@ -16,7 +19,7 @@ async def embed_chunks(chunks: list[CodeChunk]) -> list[list[float]]:
         batch = texts[i:i+128]
         result = await client.embed(
             batch,
-            model="voyage-code-2",
+            model="voyage-code-3",
             input_type="document",  ## "document" for indexing, "query" for quering
         )
         all_embeddings.extend(result.embeddings)

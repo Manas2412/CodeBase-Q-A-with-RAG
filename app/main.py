@@ -5,6 +5,7 @@ import asyncio
 import redis.asyncio as aioredis
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -40,6 +41,14 @@ async def lifespan(app: FastAPI):
     await redis_pool.aclose()
     
 app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Request/response models
 class AddRequest(BaseModel):

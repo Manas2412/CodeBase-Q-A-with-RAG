@@ -13,15 +13,27 @@ _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
 
 def needs_ssl(dsn: str) -> bool:
     """
-    Cloud Postgres (Neon, RDS, etc.) requires SSL; local Docker containers
-    don't speak SSL. Auto-detect from the hostname so the same code runs
-    both ways. Override with DB_SSL=true/false if you need to force.
+    Cloud Postgres (Neon, RDS, etc.) requires SSL; local containers don't.
+    Auto-detect from the hostname so the same code runs in both worlds.
+
+    Local categories detected:
+      • Loopback addresses: localhost, 127.0.0.1, 0.0.0.0, ::1
+      • Unqualified hostnames (no dots): docker-compose service names,
+        kubernetes pod names, internal short names like 'postgres' or 'db'.
+        Real production DBs always have qualified names.
+
+    Override with DB_SSL=true|false if you need to force one side.
     """
     override = os.getenv("DB_SSL")
     if override is not None:
         return override.strip().lower() in ("1", "true", "yes", "require")
     host = (urlparse(dsn).hostname or "").lower()
-    return host not in _LOCAL_HOSTS
+    if host in _LOCAL_HOSTS:
+        return False
+    if "." not in host:
+        # compose / k8s / docker bridge: internal, never SSL
+        return False
+    return True
 
 
 def normalise_dsn(raw: str) -> str:

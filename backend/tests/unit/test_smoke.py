@@ -32,15 +32,22 @@ def test_backend_app_is_importable():
 @pytest.mark.parametrize(
     ("dsn", "expected"),
     [
+        # Loopback — explicit local
         ("postgresql://localhost:5434/x", False),
         ("postgresql://127.0.0.1:5432/x", False),
         ("postgresql://0.0.0.0:5432/x", False),
+        # Unqualified hostnames (docker-compose service names, k8s short names)
+        ("postgresql://postgres:5432/x", False),
+        ("postgresql://db:5432/x", False),
+        ("postgresql://review-postgres-prod:5432/x", False),
+        # Qualified hostnames (anything with dots) — cloud, needs SSL
         ("postgresql://db.amazonaws.com:5432/x", True),
         ("postgresql://ep-foo.neon.tech/x", True),
+        ("postgresql://prod-db.internal.example.com/x", True),
     ],
 )
 def test_needs_ssl_detects_local_vs_cloud(dsn: str, expected: bool):
-    """Locks the auto-detect logic — local hosts skip SSL, anything else uses it."""
+    """Locks the auto-detect logic — local hosts skip SSL, qualified names use it."""
     from app.db.database import needs_ssl
 
     assert needs_ssl(dsn) is expected

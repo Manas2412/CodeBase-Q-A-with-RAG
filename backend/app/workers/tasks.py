@@ -50,7 +50,7 @@ async def _index_repo(repo_id: str, github_url: str):
         await register_vector(conn)
 
         await conn.execute(
-            "UPDATE repos SET status = 'indexing' WHERE id = $1::uuid", repo_id
+            "UPDATE projects SET status = 'indexing' WHERE id = $1::uuid", repo_id
         )
 
         repo_path = await clone_repo(github_url)
@@ -66,7 +66,7 @@ async def _index_repo(repo_id: str, github_url: str):
 
         await conn.execute(
             """
-            UPDATE repos
+            UPDATE projects
             SET status = 'ready', indexed_at = now()
             WHERE id = $1::uuid
             """,

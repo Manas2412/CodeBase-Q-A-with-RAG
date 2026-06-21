@@ -9,7 +9,17 @@ from alembic import context
 from dotenv import load_dotenv
 # Import your models so Alembic can detect them
 from app.db.database import Base, needs_ssl, normalise_dsn
-from app.db.models import Repo, Chunk
+from app.db.models import (
+    BranchEvent,
+    Checklist,
+    Chunk,
+    Commit,
+    Project,
+    Repo,  # backward-compat alias for Project
+    Review,
+    ReviewFinding,
+    User,
+)
 
 
 load_dotenv()

@@ -1,65 +1,23 @@
-# CodeBase Q&A with RAG
+# Internal Codebase Review Agent
 
-Ask natural-language questions about a GitHub repository. The app clones the repo, chunks code with **tree-sitter** (AST-aware), embeds chunks with **Voyage AI** (`voyage-code-2`), stores vectors in **PostgreSQL + pgvector**, and answers questions using **HyDE** (hypothetical code generation), **Cohere reranking**, and a **local LLM via Ollama** with streaming responses.
+An internal, agentic code-review system that watches branches on **OpenForge (Tuleap)** and **GitHub**, runs a senior-tech-lead-grade review on every push and merge using **Claude Opus 4.6 via AWS Bedrock**, and produces downloadable PDF reports with full author attribution.
 
----
+Built on top of the prior **CodeBase Q&A with RAG** project — the RAG pipeline (tree-sitter chunking + pgvector + embeddings) is reused as the model's memory of the codebase, while a new diff-only review pipeline runs on top.
 
-## Architecture
-
-Two pipelines: **ingestion** (once per repo / on webhook) and **query** (every question).
-
-```mermaid
-flowchart LR
-  subgraph ingestion[Ingestion pipeline]
-    GH[GitHub repo] --> CL[Clone git]
-    CL --> CH[AST chunker]
-    CH --> EM[Embedder voyage-code-2]
-    EM --> VS[(pgvector)]
-    CH --> PG[(PostgreSQL metadata)]
-  end
-```
-
-```mermaid
-flowchart LR
-  subgraph query[Query pipeline]
-    U[User question] --> HY[HyDE expand]
-    HY --> R[Retriever]
-    R --> VS[(pgvector top-20)]
-    VS --> CO[Cohere rerank top-5]
-    CO --> LLM[Ollama LLM]
-    LLM --> SSE[SSE stream]
-  end
-  subgraph side[Supporting]
-    RD[(Redis cache)]
-  end
-  HY -.-> RD
-  R -.-> RD
-```
-
-- **Ingestion:** `git` clone → walk supported files → **tree-sitter** chunks (functions/classes) → **Voyage** embeddings → upsert into `chunks` with vectors.
-- **Query:** **HyDE** produces a hypothetical code snippet (via **Ollama**) → embed with Voyage → **pgvector** ANN search (top 20) → **Cohere rerank** to top 5 → build prompt → **Ollama** streams tokens over **SSE**.
-- **Async jobs:** **Celery** workers use **Redis** as broker/backend for `index_repo_task` (and webhook re-index).
-- **Cache:** Redis stores retrieval results keyed by `SHA256(query + repo_id + top_k)` with a 1-hour TTL.
-
-Design docs may mention **Qdrant**, **BullMQ**, or **Claude**; **this repository** uses **pgvector only**, **Celery + Redis** for the queue, and **Ollama** for HyDE and answers (not Anthropic in code). You can swap the answerer/HyDE backends by editing `app/query/hyde.py` and `app/query/answerer.py`.
+> **Status: Phase 1 in development.** The existing Q&A surface (`/repos`, `/repos/{id}/status`, `/query`) remains functional during the transition. The review pipeline, polling trigger, wizard onboarding, and checklist UI land across the 5 weeks of Phase 1.
 
 ---
 
-## Tech stack (as implemented)
+## Architecture in one line
 
-| Layer | Choice | Notes |
-|--------|--------|--------|
-| API | FastAPI | REST + SSE streaming on `/query` |
-| Worker | Celery + Redis | Background indexing |
-| DB | PostgreSQL + **pgvector** | `repos` + `chunks` with embeddings |
-| Embeddings | Voyage **`voyage-code-2`** | Indexing + query vectors |
-| Chunking | **tree-sitter** | Python + JavaScript/TS parsers |
-| HyDE | **Ollama** (e.g. CodeLlama) | Hypothetical code for better retrieval |
-| Reranker | **Cohere** `rerank-english-v3.0` | 20 → 5 candidates |
-| LLM | **Ollama** | Streaming generation |
-| Cache | Redis | Retrieval cache |
-| Frontend | React + Vite | UI in `Frontend/` |
-| Evals (optional) | RAGAS | Listed in `pyproject.toml` |
+Two pipelines share one pgvector store:
+
+- **Indexing pipeline** (cheap, no LLM): clones repos, AST-chunks them with tree-sitter, embeds chunks via Cohere Embed v3 on Bedrock, stores in pgvector. The model's "memory of the codebase."
+- **Review pipeline** (Claude Opus 4.6 on Bedrock): on every push to a watched branch, computes the diff, retrieves related context from pgvector, sends `diff + context + checklist` to Opus, persists structured findings, generates a PDF report.
+
+The LLM **never sees the whole codebase** — only the diff plus a small RAG-retrieved context window. Cost stays bounded regardless of repo size.
+
+Detailed design: [`docs/Codebase_Review_Agent_Implementation_Plan_v3_3_FINAL.docx`](docs/Codebase_Review_Agent_Implementation_Plan_v3_3_FINAL.docx).
 
 ---
 
@@ -67,118 +25,70 @@ Design docs may mention **Qdrant**, **BullMQ**, or **Claude**; **this repository
 
 ```
 .
-├── app/
-│   ├── main.py              # FastAPI app, routes, lifespan
-│   ├── db/                  # SQLAlchemy models & DB helpers
-│   ├── ingestion/
-│   │   ├── cloner.py        # git clone, file walk
-│   │   ├── chunker.py       # tree-sitter AST chunks
-│   │   ├── embedder.py      # Voyage embeddings
-│   │   └── indexer.py       # pgvector upserts
-│   ├── query/
-│   │   ├── hyde.py          # HyDE via Ollama
-│   │   ├── retriever.py     # embed, search, rerank, Redis cache
-│   │   └── answerer.py      # Ollama streaming answer
-│   └── workers/
-│       └── tasks.py         # Celery: index_repo_task
-├── Frontend/                # React + Vite UI
-├── migrations/              # Alembic migrations
-├── pyproject.toml
-├── alembic.ini
-└── test_it.py               # Example HTTP flow against the API
+├── backend/        # FastAPI + Celery + pgvector — see backend/README.md
+├── frontend/       # React + Vite SPA — see frontend/README.md
+├── docs/           # Implementation plan and design references
+├── README.md       # this file
+└── .gitignore
 ```
 
 ---
 
-## Prerequisites
+## Tech stack at a glance
 
-- Python **3.11+** (project uses `uv` or Poetry-style deps in `pyproject.toml`)
-- **PostgreSQL** with the **pgvector** extension and a database URL
-- **Redis** (broker for Celery + retrieval cache)
-- **Ollama** running locally (HyDE + answers), with a compatible model pulled
-- API keys: **Voyage AI**, **Cohere** (optional: **GitHub token** for private repos)
-
----
-
-## Environment variables
-
-Set these (e.g. in a `.env` file loaded by the app):
-
-| Variable | Purpose |
-|----------|---------|
-| `DATABASE_URL` | PostgreSQL connection string (asyncpg-compatible; query params may be stripped for SSL) |
-| `REDIS_URL` | Redis for Celery and `retrieve()` cache |
-| `VOYAGE_API_KEY` | Voyage embeddings |
-| `COHERE_API_KEY` | Cohere rerank |
-| `OLLAMA_BASE_URL` | e.g. `http://127.0.0.1:11434` |
-| `OLLAMA_MODEL` | Model name for HyDE + answering |
-| `GITHUB_TOKEN` | Optional; injected for private GitHub clones |
-
-HyDE defaults in code point at `http://localhost:11434` and `codellama:7b` unless overridden—align these with your Ollama setup.
+| Layer | Tech |
+|---|---|
+| API | FastAPI + uvicorn |
+| Async work | Celery + Celery Beat (Redis broker) |
+| Database | PostgreSQL 15+ with pgvector |
+| Code chunking | tree-sitter (Python, JS/TS, Java, Go, Rust, C, C++) |
+| LLM (review) | AWS Bedrock — `us.anthropic.claude-opus-4-6-v1` |
+| Embeddings | AWS Bedrock — `cohere.embed-multilingual-v3` (1024 dim) |
+| Frontend | React 18 + Vite + Tailwind |
+| Trigger (Phase 1) | Outbound polling (every 5 min). Webhook upgrade path in Phase 1.5. |
+| Source platforms | OpenForge (Tuleap) + GitHub |
+| Container runtime | Docker + docker-compose |
 
 ---
 
-## Setup
+## What works today vs what's coming
 
-1. **Install dependencies** (example with `uv`):
-
-   ```bash
-   uv sync
-   ```
-
-2. **Run database migrations** (Alembic):
-
-   ```bash
-   uv run alembic upgrade head
-   ```
-
-3. **Start Ollama** and ensure the model used in `hyde.py` / env is available.
-
-4. **Start the API:**
-
-   ```bash
-   uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
-   ```
-
-5. **Start a Celery worker** (required for indexing):
-
-   ```bash
-   uv run celery -A app.workers.tasks.celery worker --loglevel=info
-   ```
-
-6. **Start the frontend** (optional):
-
-   ```bash
-   cd Frontend && npm install && npm run dev
-   ```
-
-   Point the UI at `http://127.0.0.1:8000` (see `API_BASE_URL` in `Frontend/src/App.jsx`).
+| Surface | Today | Phase 1 |
+|---|---|---|
+| Q&A over a single repo via HyDE → pgvector → LLM | ✅ Working | Retained |
+| Add a repo via URL | ✅ `/repos` (POST) | Extended into wizard with branch picker |
+| Branch-aware push trigger | ❌ | ✅ Polling agent (every 5 min) |
+| AI review with senior-tech-lead checklist | ❌ | ✅ Claude Opus on Bedrock |
+| PDF report per review | ❌ | ✅ Downloadable per review |
+| Author + committer attribution | ❌ | ✅ From `git log` ranges |
+| Force-push detection | ❌ | ✅ Dashboard banner |
+| Checklist UI | ❌ | ✅ react-jsonschema-form based |
+| Webhook ingress | ❌ | Phase 1.5 |
+| Pre-merge conflict prediction | ❌ | Phase 1.5 (zero LLM cost) |
+| AI-assisted conflict resolution (advisory) | ❌ | Phase 2 |
+| SSO / multi-tenant | ❌ | Phase 3 |
 
 ---
 
-## API overview
+## Operational prerequisites (before Phase 1)
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/repos` | Body: `{ "github_url": "..." }` — enqueue indexing; returns `repo_id` and `status` |
-| `GET` | `/repos/{repo_id}/status` | `{ status, indexed_at }` — poll until `ready` or `error` |
-| `POST` | `/query` | Body: `{ "repo_id", "question" }` — SSE stream of answer tokens |
-| `POST` | `/webhooks/github` | Re-index on push to default branch (if repo already registered) |
+1. **OpenForge service account + `tlp.k1` personal access key** → stored as `OPENFORGE_TOKEN`
+2. **AWS IAM user** (`code-review-bot`) with `AmazonBedrockFullAccess` → access keys stored in `backend/.env`
+3. *(Optional)* **GitHub PAT** if internal GitHub repos are also onboarded → stored as `GITHUB_TOKEN`
 
-Indexing can fail with vendor **rate limits** (e.g. Voyage billing / RPM). Fix account limits or adjust embedding batching; the worker marks the repo `error` on failure.
+No public ingress, no platform-team coordination, no IP allowlisting — by design, the review service makes only outbound calls.
 
 ---
 
-## Query pipeline (concept)
+## Setup, run, and deploy
 
-1. **HyDE:** Turn the user question into a short hypothetical code snippet (better match for code embeddings than raw NL).
-2. **Embed** that snippet with the same Voyage model used at index time (`input_type="query"`).
-3. **Vector search:** Top 20 rows from `chunks` by cosine distance in pgvector.
-4. **Rerank:** Cohere compresses to top 5.
-5. **Answer:** Ollama streams an answer with file/line context in the prompt.
+Coming in Phase 1 Week 0 — docker-compose files (separate dev-infra and server modes), Dockerfiles for backend and frontend, and a CI workflow. For backend-specific or frontend-specific instructions, see the sub-READMEs.
+
+- Backend setup: [`backend/README.md`](backend/README.md)
+- Frontend setup: [`frontend/README.md`](frontend/README.md)
 
 ---
 
 ## License
 
-See project license if provided; dependencies have their own licenses.
+See project license if provided; dependencies retain their original licenses.

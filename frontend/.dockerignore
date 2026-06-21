@@ -1,0 +1,25 @@
+# Local dependencies + build output (the container builds its own)
+node_modules/
+dist/
+dist-ssr/
+.vite/
+
+# IDE + OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Logs and local-only data
+*.log
+logs/
+
+# Git metadata
+.git/
+.gitignore
+
+# Tests not needed in the production image (re-add if you want them inside)
+__tests__/
+
+# Stale README inside the container
+README.md

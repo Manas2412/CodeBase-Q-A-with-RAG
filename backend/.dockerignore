@@ -1,0 +1,42 @@
+# Local virtualenv — the container builds its own
+.venv/
+venv/
+env/
+
+# Python caches and compiled artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Test caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Secrets (the container reads env from runtime, never bakes them in)
+.env
+.env.*
+!.env-sample
+
+# Git metadata (we do git operations on cloned repos, not on ourselves)
+.git/
+.gitignore
+
+# IDE + OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Logs and local-only data
+*.log
+logs/
+
+# NOTE: README.md is intentionally NOT excluded — hatchling reads it at
+# build time as the package's long-description (see `readme = "README.md"`
+# in [project] of pyproject.toml). Removing it from the build context
+# breaks `uv sync` during the image build.

@@ -1,28 +1,53 @@
-# pyproject.toml
-[tool.poetry.dependencies]
-python = "^3.11"
-fastapi = "^0.111"
-uvicorn = {extras = ["standard"], version = "^0.30"}
-sse-starlette = "^2.1"
-sqlalchemy = {extras = ["asyncio"], version = "^2.0"}
-asyncpg = "^0.29"
-pgvector = "^0.3"
-alembic = "^1.13"
-voyageai = "^0.2"
-anthropic = "^0.28"
-cohere = "^5.5"
-tree-sitter = "^0.22"
-tree-sitter-python = "^0.22"
-tree-sitter-javascript = "^0.22"
-tree-sitter-typescript = "^0.22"
-PyGithub = "^2.3"
-gitpython = "^3.1"
-celery = {extras = ["redis"], version = "^5.4"}
-redis = {extras = ["asyncio"], version = "^5.0"}
-ragas = "^0.1"
-pydantic-settings = "^2.3"
+[project]
+name = "codebase-review-agent"
+version = "0.1.0"
+description = "Internal codebase review agent (built on the CodeBase Q&A with RAG foundation)"
+requires-python = ">=3.11"
+readme = "README.md"
+
+dependencies = [
+    # Web + ASGI
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+    "sse-starlette>=2.1",
+    "python-dotenv>=1.0",
+
+    # DB + ORM + migrations
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "pgvector>=0.3",
+    "alembic>=1.13",
+
+    # Async work
+    "celery[redis]>=5.4",
+    "redis>=5.0",  # 5.x+ ships asyncio support built in (no [asyncio] extra needed)
+
+    # Code ingestion + chunking
+    "tree-sitter>=0.22",
+    "tree-sitter-python>=0.22",
+    "tree-sitter-javascript>=0.22",
+    "tree-sitter-typescript>=0.22",
+
+    # Git providers (Phase 1: OpenForge + GitHub via abstraction)
+    "PyGithub>=2.3",
+    "gitpython>=3.1",
+
+    # AWS Bedrock client — replaces Voyage / Cohere / Ollama / Anthropic SDK.
+    # Used for both LLM (Claude Opus 4.6) and embeddings (Cohere Embed v3).
+    "boto3>=1.34",
+
+    # Misc
+    "pydantic-settings>=2.3",
+]
 
 [dependency-groups]
 dev = [
     "httpx>=0.28.1",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

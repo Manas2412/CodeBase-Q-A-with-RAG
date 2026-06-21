@@ -11,6 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.db.database import needs_ssl
+from app.providers import (
+    ProviderError,
+    UnknownProviderError,
+    get_provider,
+)
 from app.workers.tasks import index_repo_task
 
 load_dotenv()
@@ -62,6 +67,22 @@ class AddRequest(BaseModel):
     # Kept as `github_url` for backward-compat with the existing frontend.
     # The probe / wizard introduced in Week 1 onwards prefers `repo_url`.
     github_url: str
+
+
+class ProbeRequest(BaseModel):
+    url: str
+
+
+class BranchOut(BaseModel):
+    name: str
+    sha: str
+    is_default: bool
+
+
+class ProbeResponse(BaseModel):
+    provider: str
+    default_branch: str
+    branches: list[BranchOut]
 
 
 def _detect_provider(url: str) -> str:
@@ -119,6 +140,52 @@ async def add_repo(body: AddRequest):
 
     index_repo_task.delay(str(project_id), repo_url)
     return {"repo_id": str(project_id), "status": "pending"}
+
+
+@app.post("/projects/probe", response_model=ProbeResponse)
+async def probe_project(body: ProbeRequest):
+    """Wizard Screen 1 → Screen 2 — paste a URL, get the actual branches.
+
+    Uses `git ls-remote --heads --symref` so we don't have to clone the repo
+    to enumerate branches. Returns provider, default branch, and the full
+    branch list with SHAs so the UI can show last-pushed info per branch.
+
+    Errors raise HTTPException(400) with a short message — the wizard
+    surfaces them as inline validation on Screen 1.
+    """
+    try:
+        provider = get_provider(body.url)
+    except UnknownProviderError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        parsed = provider.parse(body.url)
+    except ProviderError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    token = provider.get_token()
+    try:
+        default_branch, branches = await provider.list_branches(parsed, token)
+    except ProviderError as e:
+        # auth or network failure — same response envelope as a 400 from validation
+        # so the frontend can render the message uniformly
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Couldn't reach the repository: {e}. Check that the URL is "
+                f"correct and that the service-account token ({provider.token_env}) "
+                "has access."
+            ),
+        )
+
+    return ProbeResponse(
+        provider=provider.name,
+        default_branch=default_branch,
+        branches=[
+            BranchOut(name=b.name, sha=b.sha, is_default=b.is_default)
+            for b in branches
+        ],
+    )
 
 
 @app.get("/repos/{repo_id}/status")

@@ -61,32 +61,68 @@ def mock_bedrock() -> MagicMock:
 
 
 # ── Synthetic git repo on disk ────────────────────────────────────────────
+def _git(*args: str, cwd: Path) -> None:
+    """Run git in cwd; capture+ignore output."""
+    subprocess.run(args, cwd=cwd, check=True, capture_output=True)
+
+
 @pytest.fixture
 def synthetic_repo(tmp_path: Path) -> Path:
-    """Build a tiny real git repo in a pytest tmp_path. Returns its path.
-
-    Use for tests that exercise:
-      - app/ingestion/cloner.py (walking files, supported extensions)
-      - app/providers/* (URL parsing — not network ops)
-      - future diff parser (commit ranges, force-push detection)
-    """
+    """Tiny single-branch repo (`main`) with one commit. For cloner / chunker tests."""
     repo = tmp_path / "synthetic-repo"
     repo.mkdir()
 
-    def _run(*args: str) -> None:
-        subprocess.run(args, cwd=repo, check=True, capture_output=True)
-
-    _run("git", "init", "-q", "-b", "main")
-    _run("git", "config", "user.email", "test@example.invalid")
-    _run("git", "config", "user.name", "Test Author")
-    _run("git", "config", "commit.gpgsign", "false")
+    _git("git", "init", "-q", "-b", "main", cwd=repo)
+    _git("git", "config", "user.email", "test@example.invalid", cwd=repo)
+    _git("git", "config", "user.name", "Test Author", cwd=repo)
+    _git("git", "config", "commit.gpgsign", "false", cwd=repo)
 
     (repo / "README.md").write_text("# synthetic-repo\n")
     (repo / "hello.py").write_text(
         "def greet(name: str) -> str:\n"
         "    return f'hello, {name}'\n"
     )
-    _run("git", "add", ".")
-    _run("git", "commit", "-q", "-m", "initial commit")
+    _git("git", "add", ".", cwd=repo)
+    _git("git", "commit", "-q", "-m", "initial commit", cwd=repo)
 
     return repo
+
+
+@pytest.fixture
+def multi_branch_repo(tmp_path: Path) -> Path:
+    """Synthetic repo with three branches: main (default), dev, uat.
+
+    Use for tests exercising provider.list_branches() and the clone manager
+    against a real git remote via a `file://` URL — no network, fully isolated.
+    """
+    repo = tmp_path / "multi-branch-repo"
+    repo.mkdir()
+
+    _git("git", "init", "-q", "-b", "main", cwd=repo)
+    _git("git", "config", "user.email", "test@example.invalid", cwd=repo)
+    _git("git", "config", "user.name", "Test Author", cwd=repo)
+    _git("git", "config", "commit.gpgsign", "false", cwd=repo)
+
+    (repo / "README.md").write_text("# multi-branch repo\n")
+    _git("git", "add", ".", cwd=repo)
+    _git("git", "commit", "-q", "-m", "initial commit on main", cwd=repo)
+
+    for branch in ("dev", "uat"):
+        _git("git", "checkout", "-q", "-b", branch, cwd=repo)
+        (repo / f"{branch}.md").write_text(f"# {branch} branch marker\n")
+        _git("git", "add", ".", cwd=repo)
+        _git("git", "commit", "-q", "-m", f"add {branch} marker", cwd=repo)
+
+    _git("git", "checkout", "-q", "main", cwd=repo)
+    return repo
+
+
+# ── Storage paths redirected to tmp ───────────────────────────────────────
+@pytest.fixture
+def temp_repos_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point CODEREVIEW_REPOS_DIR at a fresh pytest tmp_path.
+
+    Lets clone_manager tests write to disk without polluting ~/.codereview/repos.
+    """
+    monkeypatch.setenv("CODEREVIEW_REPOS_DIR", str(tmp_path))
+    return tmp_path

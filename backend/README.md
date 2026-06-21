@@ -148,28 +148,153 @@ Run with `uv run pytest`. CI guardrail caps real Bedrock token spend per run.
 
 ---
 
-## Setup (manual + Docker)
+## Setup
 
-Coming in Phase 1 Week 0. The plan:
+Two ways to run the backend: natively with `uv` (best for hot-reload during development) or fully containerised via docker-compose (matches the server deployment).
 
-- `docker-compose.yml` + `docker-compose.dev-infra.yml` for local infra (Postgres+pgvector, Redis, Gitea for tests)
-- `docker-compose.server.yml` for full server deployment
-- `backend/Dockerfile` (multi-stage build)
-- Manual instructions for running natively with `uv` against the dev-infra compose
+### Prerequisites
 
-Quick preview of what the manual flow will look like:
+- Python 3.11+ (the project pins `>=3.11` and uses `uv` to manage the venv — install uv with `curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- Docker Desktop (or any Docker daemon) for the Postgres + Redis containers
+- `git` on PATH (used by the future polling agent for `clone` / `fetch` / `ls-remote`)
+
+### Step 1 — bring up the datastores
+
+From the **repo root**, not from `backend/`:
+
+```bash
+docker compose -f docker-compose.yml up -d
+```
+
+This starts Postgres+pgvector on host port 5434 and Redis on host port 6380, with named volumes that persist data across restarts. Verify:
+
+```bash
+docker compose ps
+docker exec codereview-postgres pg_isready -U codereview
+# Expect:  /var/run/postgresql:5432 - accepting connections
+```
+
+### Step 2 — copy and fill in `.env`
 
 ```bash
 cd backend
-uv venv && uv sync
-uv run alembic upgrade head
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8000
-# in a second shell:
-uv run celery -A app.workers.tasks.celery worker --loglevel=info
-uv run celery -A app.workers.tasks.celery beat --loglevel=info
+cp .env-sample .env
 ```
 
-Detailed install + Docker docs land alongside the compose files.
+The defaults already point at the local docker containers. The only values you need to fill in are:
+
+| Variable | Where to get it |
+|---|---|
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | AWS Console → IAM → `code-review-bot` user → Security credentials → Create access key |
+| `OPENFORGE_TOKEN` | OpenForge → your service account → Preferences → Personal Access Keys → Generate new key (scopes: REST + Git repository) |
+| `GITHUB_TOKEN` *(optional)* | GitHub → Settings → Developer settings → Personal access tokens (only if you also onboard internal GitHub repos) |
+
+### Step 3 — install dependencies
+
+```bash
+# Still in backend/
+uv venv                    # creates backend/.venv with the pinned Python
+uv sync                    # installs everything from pyproject.toml + uv.lock
+```
+
+`uv sync` resolves ~70 packages on first run; subsequent runs are near-instant when nothing changes.
+
+### Step 4 — run database migrations
+
+```bash
+uv run alembic upgrade head
+```
+
+Verify the schema landed:
+
+```bash
+docker exec codereview-postgres psql -U codereview -d codereview -c "\dt"
+# Expect:  alembic_version, chunks, repos
+```
+
+### Step 5 — run the API
+
+```bash
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+`--reload` enables hot-reload on source changes — drop it for production-style runs. Verify:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/repos \
+  -H "Content-Type: application/json" \
+  -d '{"github_url":"https://github.com/octocat/Hello-World"}'
+# Expect:  {"repo_id":"<uuid>","status":"pending"}
+```
+
+### Step 6 — run the Celery worker (separate shell)
+
+```bash
+cd backend
+source .venv/bin/activate    # or run via `uv run` if you prefer
+celery -A app.workers.tasks.celery worker --loglevel=info
+```
+
+### Step 7 — run Celery Beat (separate shell, Phase 1 Week 3 onwards)
+
+Beat is the scheduler that fires the polling agent. Only needed once Week 3 lands; ignore for Week 0–2:
+
+```bash
+celery -A app.workers.tasks.celery beat --loglevel=info
+```
+
+---
+
+## Running everything in Docker
+
+For server deployment or full-stack testing, skip the native steps above and use:
+
+```bash
+# From repo root
+docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
+
+# Verify everything is healthy
+docker compose -f docker-compose.yml -f docker-compose.server.yml ps
+
+# Test the API via Caddy on :80
+curl -s http://localhost/healthz                 # frontend health
+curl -s -X POST http://localhost/api/repos \
+  -H "Content-Type: application/json" \
+  -d '{"github_url":"https://github.com/octocat/Hello-World"}'
+# Expect:  {"repo_id":"<uuid>","status":"pending"}
+
+# Bring it all down
+docker compose -f docker-compose.yml -f docker-compose.server.yml down
+```
+
+This brings up `backend-api`, `backend-worker`, `backend-beat`, `frontend`, and `caddy` — five services on top of the postgres + redis from the base compose.
+
+---
+
+## Tests
+
+```bash
+cd backend
+uv run pytest                # everything fast (unit + future integration)
+uv run pytest tests/unit     # unit only
+uv run pytest -v             # verbose, show every test name
+uv run pytest -m "not eval"  # everything except the Bedrock-spending eval suite
+```
+
+See [`backend/tests/README.md`](tests/README.md) for the layout, markers, and fixtures.
+
+---
+
+## Building the Docker image manually
+
+You usually let `docker compose build` do this, but the standalone command is:
+
+```bash
+# From repo root
+docker build -t codereview-backend:dev ./backend
+```
+
+The image is multi-stage: uv binary → builder venv (deps cached) → `python:3.11-slim` runtime with `git` and a non-root `app` user. Final size: ~610MB.
 
 ---
 

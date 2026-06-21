@@ -74,19 +74,100 @@ A multi-route dashboard for the review agent. Routes:
 
 ---
 
-## Setup (manual + Docker)
+## Setup
 
-Coming in Phase 1 Week 0 alongside the docker-compose files.
+### Prerequisites
 
-Quick preview of the manual flow:
+- Node.js 20 or newer (`brew install node@20` on macOS)
+- The backend running somewhere reachable — either natively on `http://127.0.0.1:8000` or via the server compose at `http://localhost/api`
+
+### Step 1 — install dependencies
 
 ```bash
 cd frontend
 npm install
-npm run dev          # Vite dev server at http://127.0.0.1:5173
 ```
 
-The dev server proxies API calls to the backend running at `http://127.0.0.1:8000`. Production build will be served via Caddy as part of the server-mode docker-compose.
+### Step 2 — run the Vite dev server
+
+```bash
+npm run dev
+```
+
+Opens at **http://127.0.0.1:5173** with hot-module reload. Currently shows the single-page Q&A UI from the original CodeBase Q&A project — the wizard + dashboard land during Phase 1 Week 4.
+
+### Step 3 — point at the backend
+
+The current `src/App.jsx` hard-codes:
+
+```javascript
+const API_BASE_URL = 'http://127.0.0.1:8000';
+```
+
+Adjust if the backend is on a different port or behind Caddy. A proper env-driven config (`VITE_API_BASE_URL`) lands during the Phase 1 Week 4 refactor.
+
+### Build for production
+
+```bash
+npm run build
+```
+
+Produces `dist/` — the static bundle served by nginx in the production Docker image.
+
+```bash
+npm run preview
+```
+
+Serves the built `dist/` locally for a final sanity check before deploying.
+
+---
+
+## Running in Docker
+
+For server-style runs (everything behind Caddy + nginx serving the built SPA):
+
+```bash
+# From repo root, not frontend/
+docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
+
+# Open the dashboard via Caddy on :80
+open http://localhost/
+```
+
+Bring it down:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.server.yml down
+```
+
+---
+
+## Building the Docker image manually
+
+```bash
+# From repo root
+docker build -t codereview-frontend:dev ./frontend
+```
+
+The image is two-stage: `node:20-alpine` runs `npm install` + `npm run build`, then `nginx:1.27-alpine` serves the `dist/`. Final size: ~76MB.
+
+Verify the image:
+
+```bash
+docker run -d --rm --name codereview-frontend-test -p 8081:80 codereview-frontend:dev
+sleep 2
+curl -s http://localhost:8081/healthz
+# Expect:  ok
+docker stop codereview-frontend-test
+```
+
+---
+
+## Notes on `npm ci` vs `npm install` inside Docker
+
+The Dockerfile uses `npm install` (not `npm ci`) because some npm versions resolve platform-conditional transitive dependencies (`@emnapi/*`) differently. `npm install` is forgiving; `npm ci` is strict and refuses to install when the lockfile is "out of sync" — even when nothing is actually broken.
+
+If you want strict reproducible builds, upgrade your local npm to match the container (`npm install -g npm@latest`) and revert the Dockerfile to `npm ci`.
 
 ---
 

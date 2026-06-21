@@ -80,12 +80,99 @@ No public ingress, no platform-team coordination, no IP allowlisting — by desi
 
 ---
 
-## Setup, run, and deploy
+## Quickstart
 
-Coming in Phase 1 Week 0 — docker-compose files (separate dev-infra and server modes), Dockerfiles for backend and frontend, and a CI workflow. For backend-specific or frontend-specific instructions, see the sub-READMEs.
+Two run modes — pick whichever matches what you're doing.
 
-- Backend setup: [`backend/README.md`](backend/README.md)
-- Frontend setup: [`frontend/README.md`](frontend/README.md)
+### Mode A — Local dev (recommended while iterating)
+
+Datastores in Docker, backend and frontend running natively for fast hot-reload.
+
+```bash
+# 1. Bring up Postgres+pgvector and Redis
+docker compose -f docker-compose.yml up -d
+
+# 2. Backend (one shell)
+cd backend
+cp .env-sample .env                  # fill in AWS + OPENFORGE_TOKEN
+uv venv && uv sync
+uv run alembic upgrade head
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+
+# 3. Celery worker (second shell)
+cd backend
+uv run celery -A app.workers.tasks.celery worker --loglevel=info
+
+# 4. Frontend (third shell)
+cd frontend
+npm install
+npm run dev                          # opens at http://127.0.0.1:5173
+
+# 5. Bring it down when done
+cd ../..
+docker compose -f docker-compose.yml down
+```
+
+### Mode B — Full server stack in Docker
+
+Everything in containers behind Caddy on `:80`. Matches the production layout.
+
+```bash
+# 1. Build the images
+docker build -t codereview-backend:dev ./backend
+docker build -t codereview-frontend:dev ./frontend
+
+# 2. Configure backend env (Bedrock keys + OpenForge token)
+cp backend/.env-sample backend/.env
+# edit backend/.env
+
+# 3. Bring the entire stack up
+docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
+
+# 4. Verify
+docker compose -f docker-compose.yml -f docker-compose.server.yml ps
+curl -s http://localhost/healthz                     # frontend via Caddy
+curl -s -X POST http://localhost/api/repos \
+  -H "Content-Type: application/json" \
+  -d '{"github_url":"https://github.com/octocat/Hello-World"}'
+
+# 5. Bring it down
+docker compose -f docker-compose.yml -f docker-compose.server.yml down
+```
+
+### Mode C — Adds Gitea for testing (overlay on either mode)
+
+When you need a self-hosted git server to exercise the provider abstraction without hitting real OpenForge or GitHub:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev-infra.yml up -d
+
+# Gitea web UI at http://localhost:3001
+# First run: create a 'gitea' database in Postgres before opening the wizard
+docker exec codereview-postgres psql -U codereview -d codereview \
+  -c "CREATE DATABASE gitea OWNER codereview;"
+```
+
+---
+
+## Tests
+
+```bash
+cd backend
+uv run pytest                # all fast tests
+uv run pytest -v             # verbose
+uv run pytest -m "not eval"  # skip the Bedrock-spending eval suite
+```
+
+See [`backend/tests/README.md`](backend/tests/README.md) for the layered structure.
+
+---
+
+## Further reading
+
+- Detailed backend instructions and module map: [`backend/README.md`](backend/README.md)
+- Frontend instructions and route map: [`frontend/README.md`](frontend/README.md)
+- Full architecture + phased plan: [`docs/Codebase_Review_Agent_Implementation_Plan_v3_3_FINAL.docx`](docs/Codebase_Review_Agent_Implementation_Plan_v3_3_FINAL.docx)
 
 ---
 

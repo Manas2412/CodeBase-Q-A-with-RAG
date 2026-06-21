@@ -129,18 +129,6 @@ async def query_repo(body: QueryRequest):
 
     return StreamingResponse(token_stream(), media_type="text/event-stream")
 
-@app.post("/webhooks/github")
-async def github_webhook(payload: dict):
-    """
-    Re-index on push to default branch.
-    """
-    default_branch = payload.get("repository", {}).get("default_branch", "main")
-    if payload.get("ref") == f"refs/heads/{default_branch}":
-        github_url = payload["repository"]["clone_url"]
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT id FROM repos WHERE github_url = $1", github_url
-            )
-            if row:
-                index_repo_task.delay(str(row["id"]), github_url)
-    return {"ok": True}
+# Note: /webhooks/github removed in pre-build cleanup.
+# Push triggers are handled by the polling agent introduced in Phase 1 Week 3
+# (see Implementation Plan v3.3 §4 — Variant A polling trigger layer).

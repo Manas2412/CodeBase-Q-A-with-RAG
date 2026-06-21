@@ -1,0 +1,52 @@
+# Caddy reverse proxy for the review agent in server mode.
+#
+# For local / internal deployment without TLS gymnastics, we listen on :80
+# and let Caddy auto-decide HTTPS later when you point a real hostname at it.
+#
+# Routes:
+#   /api/*   →  backend-api:8000   (FastAPI)
+#   /        →  frontend:80         (Vite-built SPA served by nginx)
+#
+# Adding TLS later:
+#   1. Point a hostname at this host (e.g., review.example.com → this IP)
+#   2. Replace the `:80` site address with the hostname
+#   3. Caddy automatically provisions Let's Encrypt cert + redirects
+#
+# Hot-tip for local dev: this file is bind-mounted from caddy/Caddyfile,
+# so edits take effect on `docker compose restart caddy`.
+
+{
+    # No automatic HTTPS in dev/internal mode — explicit per-site control.
+    auto_https off
+    # Set an email for Let's Encrypt when you flip to a real domain
+    # email admin@example.com
+}
+
+:80 {
+    encode gzip zstd
+
+    # All API traffic goes to FastAPI
+    handle /api/* {
+        # Strip /api prefix before forwarding so FastAPI sees /repos, not /api/repos
+        uri strip_prefix /api
+        reverse_proxy backend-api:8000
+    }
+
+    # Everything else goes to the frontend (nginx + SPA)
+    handle {
+        reverse_proxy frontend:80
+    }
+
+    # Standard security headers — uncomment for hardening once UI is live
+    # header {
+    #     X-Content-Type-Options "nosniff"
+    #     X-Frame-Options "SAMEORIGIN"
+    #     Referrer-Policy "strict-origin-when-cross-origin"
+    #     Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    # }
+
+    log {
+        output stdout
+        format console
+    }
+}

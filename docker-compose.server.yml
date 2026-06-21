@@ -1,0 +1,115 @@
+# Server overlay: full deployment with Caddy + backend (API + worker + Beat)
+# + frontend, all behind Caddy.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
+#
+# Public endpoints:
+#   http://localhost/        → frontend SPA via Caddy
+#   http://localhost/api/*   → backend API via Caddy
+#
+# When you point a real hostname at this host, edit caddy/Caddyfile to
+# replace `:80` with the hostname and Caddy provisions HTTPS automatically.
+
+services:
+
+  backend-api:
+    image: codereview-backend:dev
+    container_name: codereview-backend-api
+    env_file:
+      - ./backend/.env
+    environment:
+      # Override the host-side URLs so the container reaches sibling services
+      # by their compose service names, not by localhost.
+      DATABASE_URL: postgresql+asyncpg://codereview:local_dev_only@postgres:5432/codereview
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      # Persistent clone directory for the future review agent
+      - codereview-repos:/var/lib/codereview/repos
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    restart: unless-stopped
+    networks:
+      - codereview
+
+  backend-worker:
+    image: codereview-backend:dev
+    container_name: codereview-backend-worker
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://codereview:local_dev_only@postgres:5432/codereview
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - codereview-repos:/var/lib/codereview/repos
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      ["celery", "-A", "app.workers.tasks.celery", "worker", "--loglevel=info"]
+    restart: unless-stopped
+    networks:
+      - codereview
+
+  backend-beat:
+    image: codereview-backend:dev
+    container_name: codereview-backend-beat
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://codereview:local_dev_only@postgres:5432/codereview
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command:
+      ["celery", "-A", "app.workers.tasks.celery", "beat", "--loglevel=info"]
+    restart: unless-stopped
+    networks:
+      - codereview
+
+  frontend:
+    image: codereview-frontend:dev
+    container_name: codereview-frontend
+    depends_on:
+      - backend-api
+    restart: unless-stopped
+    networks:
+      - codereview
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: codereview-caddy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - codereview-caddy-data:/data
+      - codereview-caddy-config:/config
+    depends_on:
+      - backend-api
+      - frontend
+    restart: unless-stopped
+    networks:
+      - codereview
+
+
+volumes:
+  # Where the future polling agent keeps persistent clones of monitored repos.
+  codereview-repos:
+    name: codereview-repos
+  # Caddy's TLS cert + state — keep across restarts so we don't hit
+  # Let's Encrypt rate limits when we eventually flip on TLS.
+  codereview-caddy-data:
+    name: codereview-caddy-data
+  codereview-caddy-config:
+    name: codereview-caddy-config

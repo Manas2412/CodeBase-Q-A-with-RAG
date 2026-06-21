@@ -1,0 +1,69 @@
+# Base compose: shared infrastructure (Postgres + Redis).
+#
+# This file is always included. Layer on top of it with override files:
+#   docker-compose.dev-infra.yml  — adds Gitea (for local testing)
+#   docker-compose.server.yml     — adds Caddy + backend + frontend
+#
+# Run modes:
+#   Local dev infra only (run app + frontend natively):
+#     docker compose -f docker-compose.yml -f docker-compose.dev-infra.yml up -d
+#
+#   Full server deployment:
+#     docker compose -f docker-compose.yml -f docker-compose.server.yml up -d
+#
+# Volumes and container names match the standalone docker run commands so
+# data carries over if you migrate from standalone-containers to compose.
+
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: codereview-postgres
+    environment:
+      POSTGRES_USER: codereview
+      POSTGRES_PASSWORD: local_dev_only
+      POSTGRES_DB: codereview
+    ports:
+      - "5434:5432"   # host:5434 → container:5432 (avoid conflicts with other local Postgres)
+    volumes:
+      - codereview-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codereview -d codereview"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - codereview
+
+  redis:
+    image: redis:7-alpine
+    container_name: codereview-redis
+    ports:
+      - "6380:6379"   # host:6380 → container:6379
+    volumes:
+      - codereview-redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - codereview
+
+
+volumes:
+  # name: keeps the volumes outside compose's project-name prefix so they
+  # match the standalone `docker run -v codereview-pgdata:...` containers
+  # — same data, whichever way you start things.
+  codereview-pgdata:
+    name: codereview-pgdata
+  codereview-redisdata:
+    name: codereview-redisdata
+
+
+networks:
+  codereview:
+    name: codereview
+    driver: bridge

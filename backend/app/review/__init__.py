@@ -15,6 +15,12 @@ from app.review.bedrock_client import (
     ChatResponse,
     get_bedrock_client,
 )
+from app.review.checklist import (
+    DEFAULT_CHECKLIST,
+    DEFAULT_CHECKLIST_VERSION,
+    Rule,
+    format_checklist,
+)
 from app.review.context_builder import (
     DEFAULT_CONTEXT_BUDGET_TOKENS,
     DEFAULT_SEMANTIC_TOP_K,
@@ -27,6 +33,14 @@ from app.review.diff_parser import (
     DiffHunk,
     commits_between,
     diff_between,
+)
+from app.review.reviewer import (
+    Finding,
+    ReviewParseError,
+    ReviewResult,
+    parse_review_response,
+    review_diff,
+    run_review_for_push,
 )
 
 __all__ = [
@@ -47,4 +61,16 @@ __all__ = [
     "DEFAULT_CONTEXT_BUDGET_TOKENS",
     "DEFAULT_SEMANTIC_TOP_K",
     "build_context",
+    # checklist
+    "DEFAULT_CHECKLIST",
+    "DEFAULT_CHECKLIST_VERSION",
+    "Rule",
+    "format_checklist",
+    # reviewer
+    "Finding",
+    "ReviewParseError",
+    "ReviewResult",
+    "parse_review_response",
+    "review_diff",
+    "run_review_for_push",
 ]

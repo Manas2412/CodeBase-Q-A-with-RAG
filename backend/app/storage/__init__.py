@@ -8,6 +8,7 @@ from app.storage.clone_manager import (
     fetch,
     get_clone_path,
     is_ancestor,
+    materialize_tree,
     repos_base_dir,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "fetch",
     "get_clone_path",
     "is_ancestor",
+    "materialize_tree",
     "repos_base_dir",
 ]

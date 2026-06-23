@@ -20,8 +20,11 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 
 class CloneError(Exception):
@@ -160,3 +163,51 @@ def cleanup(project_id: str | uuid.UUID) -> None:
     path = get_clone_path(project_id)
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
+
+
+@asynccontextmanager
+async def materialize_tree(
+    project_id: str | uuid.UUID, ref: str = "HEAD"
+) -> AsyncIterator[Path]:
+    """Yield a filesystem path with `ref` checked out.
+
+    Bare (mirror) clones have no working tree — they hold objects + refs but
+    can't be `os.walk`-ed for files. For ingestion (chunking) we need actual
+    file content, so we add a `git worktree` pointing at the given ref to a
+    fresh tmpdir, yield the path, then tear down on exit.
+
+    Use as an async context manager::
+
+        async with materialize_tree(project_id, "main") as tree_path:
+            for path, source, lang in walk_code_files(tree_path):
+                ...
+
+    The worktree is removed even when the body raises, so partial state never
+    leaks into the bare clone's metadata.
+    """
+    clone_path = get_clone_path(project_id)
+    if not (clone_path / "HEAD").exists():
+        raise CloneError(
+            f"No clone at {clone_path}; call ensure_cloned() first."
+        )
+
+    # git worktree wants the destination NOT to exist or to be empty. We make
+    # a parent dir we own and let git create the subdir.
+    parent = Path(tempfile.mkdtemp(prefix="codereview-worktree-"))
+    worktree = parent / "tree"
+    try:
+        await _run_git(
+            "worktree", "add", "--detach", "--quiet", str(worktree), ref,
+            cwd=clone_path,
+        )
+        yield worktree
+    finally:
+        # Best-effort cleanup. Don't mask the original exception if any.
+        try:
+            await _run_git(
+                "worktree", "remove", "--force", str(worktree),
+                cwd=clone_path,
+            )
+        except CloneError:
+            pass
+        shutil.rmtree(parent, ignore_errors=True)

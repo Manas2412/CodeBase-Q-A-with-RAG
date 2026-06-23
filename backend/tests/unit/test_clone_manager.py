@@ -227,3 +227,98 @@ def test_cleanup_is_safe_when_clone_missing(temp_repos_dir: Path):
     """Should silently no-op, not raise."""
     pid = uuid.uuid4()
     clone_manager.cleanup(pid)  # no clone exists; just returns
+
+
+# ── materialize_tree ───────────────────────────────────────────────────
+@pytest.mark.asyncio
+async def test_materialize_tree_exposes_files_of_ref(
+    temp_repos_dir: Path, multi_branch_repo: Path
+):
+    """A worktree at `main` should let us read main's files via the filesystem."""
+    pid = uuid.uuid4()
+    await clone_manager.ensure_cloned(pid, _file_url(multi_branch_repo))
+
+    async with clone_manager.materialize_tree(pid, "main") as tree:
+        # main's README is part of the initial commit
+        assert (tree / "README.md").read_text() == "# multi-branch repo\n"
+        # main does NOT carry the dev/uat markers
+        assert not (tree / "dev.md").exists()
+        assert not (tree / "uat.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_materialize_tree_different_refs_yield_different_files(
+    temp_repos_dir: Path, multi_branch_repo: Path
+):
+    """Same project, two refs → each sees its own commit content."""
+    pid = uuid.uuid4()
+    await clone_manager.ensure_cloned(pid, _file_url(multi_branch_repo))
+
+    async with clone_manager.materialize_tree(pid, "dev") as dev_tree:
+        assert (dev_tree / "dev.md").exists()
+
+    async with clone_manager.materialize_tree(pid, "uat") as uat_tree:
+        # uat was branched off dev, so it has both dev.md and uat.md
+        assert (uat_tree / "dev.md").exists()
+        assert (uat_tree / "uat.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_materialize_tree_cleans_up_after_exit(
+    temp_repos_dir: Path, multi_branch_repo: Path
+):
+    """The worktree dir and its parent tmp must be gone after the context exits."""
+    pid = uuid.uuid4()
+    await clone_manager.ensure_cloned(pid, _file_url(multi_branch_repo))
+
+    captured: Path | None = None
+    async with clone_manager.materialize_tree(pid, "main") as tree:
+        captured = tree
+        assert tree.exists()
+
+    assert captured is not None
+    assert not captured.exists(), "worktree dir should be removed on exit"
+    assert not captured.parent.exists(), "tmp parent dir should be removed too"
+
+    # And the bare clone shouldn't think any worktrees are still registered
+    out = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=clone_manager.get_clone_path(pid),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    # Only the bare clone itself should be listed, no leftover linked worktrees
+    assert "worktree" in out
+    # No linked worktree under our codereview-worktree- prefix
+    assert "codereview-worktree-" not in out
+
+
+@pytest.mark.asyncio
+async def test_materialize_tree_raises_when_clone_missing(temp_repos_dir: Path):
+    pid = uuid.uuid4()
+    with pytest.raises(clone_manager.CloneError, match="No clone"):
+        async with clone_manager.materialize_tree(pid, "main"):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_materialize_tree_cleans_up_after_exception(
+    temp_repos_dir: Path, multi_branch_repo: Path
+):
+    """If the body raises, the worktree must still be cleaned up."""
+    pid = uuid.uuid4()
+    await clone_manager.ensure_cloned(pid, _file_url(multi_branch_repo))
+
+    captured: Path | None = None
+
+    class _Boom(Exception):
+        pass
+
+    with pytest.raises(_Boom):
+        async with clone_manager.materialize_tree(pid, "main") as tree:
+            captured = tree
+            raise _Boom("synthetic failure inside the context body")
+
+    assert captured is not None
+    assert not captured.exists()

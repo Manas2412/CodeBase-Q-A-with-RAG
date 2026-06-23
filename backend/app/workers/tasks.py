@@ -1,15 +1,11 @@
 """Celery tasks.
 
 Currently:
-  • index_repo_task — initial onboarding job. Clone the repo into the
-    persistent clone manager, materialize the default branch, walk + chunk
-    the files, mark the project ready.
+  • index_repo_task — initial onboarding job. Clone into the persistent
+    clone manager, materialize the default branch, walk + chunk + embed +
+    pgvector-upsert, mark the project ready.
 
-What's NOT here yet:
-  • Embedding + pgvector upsert — moves over in Phase 1 Week 2 when the
-    Bedrock embedder lands. Until then we chunk in-memory as a smoke
-    signal: confirms the cloner, tree-sitter parser, and chunker all
-    work end-to-end on real repositories without spending LLM tokens.
+What's not here yet:
   • Polling / review tasks — Week 3.
 """
 
@@ -26,8 +22,16 @@ from pgvector.asyncpg import register_vector
 from app.db.database import needs_ssl
 from app.ingestion.chunker import chunk_file
 from app.ingestion.cloner import walk_code_files
+from app.ingestion.embedder import embed_chunks
+from app.ingestion.indexer import prune_chunks_not_in_commit, upsert_chunks
 from app.providers import ProviderError, UnknownProviderError, get_provider
-from app.storage import CloneError, ensure_cloned, fetch, materialize_tree
+from app.storage import (
+    CloneError,
+    branch_head,
+    ensure_cloned,
+    fetch,
+    materialize_tree,
+)
 
 load_dotenv()
 
@@ -49,14 +53,13 @@ def get_dsn() -> str:
 
 @celery.task(bind=True, max_retries=3, default_retry_delay=10)
 def index_repo_task(self, project_id: str, repo_url: str | None = None):
-    """Initial-onboarding task.
+    """Initial-onboarding indexing.
 
     Parameters
     ----------
     project_id : The project's UUID.
-    repo_url   : Optional. Kept for backward-compat with the existing
-                 enqueue site in /repos POST. If omitted, the URL is
-                 looked up from the projects row.
+    repo_url   : Optional. Kept for back-compat with the existing /repos
+                 POST call site. Looked up from the projects row when omitted.
     """
     try:
         asyncio.run(_index_repo(project_id, repo_url))
@@ -71,7 +74,7 @@ async def _index_repo(project_id: str, repo_url: str | None) -> None:
         conn = await asyncpg.connect(dsn=dsn, ssl=needs_ssl(dsn))
         await register_vector(conn)
 
-        # 1. Fetch the project row (and fill repo_url from DB if caller didn't supply)
+        # 1. Load project row → resolve repo_url + default_branch from DB
         row = await conn.fetchrow(
             "SELECT repo_url, default_branch FROM projects WHERE id = $1::uuid",
             project_id,
@@ -82,13 +85,12 @@ async def _index_repo(project_id: str, repo_url: str | None) -> None:
         repo_url = repo_url or row["repo_url"]
         default_branch = row["default_branch"] or "HEAD"
 
-        # 2. Mark indexing
         await conn.execute(
             "UPDATE projects SET status = 'indexing' WHERE id = $1::uuid",
             project_id,
         )
 
-        # 3. Resolve provider, inject auth into the clone URL
+        # 2. Provider abstraction → auth-injected clone URL
         try:
             provider = get_provider(repo_url)
             parsed = provider.parse(repo_url)
@@ -96,21 +98,42 @@ async def _index_repo(project_id: str, repo_url: str | None) -> None:
             raise CloneError(f"Provider error for {repo_url!r}: {e}") from e
         auth_url = provider.auth_url(parsed, provider.get_token())
 
-        # 4. Persistent clone (no-op if already present) + incremental fetch
+        # 3. Clone (no-op if present) + incremental fetch
         await ensure_cloned(project_id, auth_url)
         await fetch(project_id)
 
-        # 5. Materialize the default branch and chunk every supported file.
-        #    Embedding + upsert are deferred to Week 2 (Bedrock).
-        total_chunks = 0
+        # 4. Capture the SHA we're indexing so future re-indexes can prune
+        commit_sha = await branch_head(project_id, default_branch)
+
+        # 5. Walk files, chunk via tree-sitter, embed via Bedrock Cohere v3,
+        #    upsert into pgvector. We accumulate chunks across the whole
+        #    walk and flush in one indexer call so the embedding batching
+        #    in embed_chunks() can pack 96-text Bedrock calls efficiently.
+        all_chunks = []
         async with materialize_tree(project_id, default_branch) as tree_path:
             for file_path, source, language in walk_code_files(tree_path):
-                chunks = chunk_file(file_path, source, language)
-                total_chunks += len(chunks)
-        print(
-            f"[indexer] {total_chunks} chunks parsed from {repo_url} "
-            f"@ {default_branch} (not embedded yet)"
-        )
+                all_chunks.extend(chunk_file(file_path, source, language))
+
+        if not all_chunks:
+            print(
+                f"[indexer] {repo_url} @ {default_branch} has zero supported-language "
+                "chunks; marking ready with empty index"
+            )
+        else:
+            print(
+                f"[indexer] embedding {len(all_chunks)} chunks "
+                f"from {repo_url} @ {default_branch}"
+            )
+            embeddings = await embed_chunks(all_chunks)
+            await upsert_chunks(
+                conn,
+                project_id=project_id,
+                chunks=all_chunks,
+                embeddings=embeddings,
+                commit_sha=commit_sha,
+            )
+            # Sweep away rows from prior indexing runs (deleted files etc.)
+            await prune_chunks_not_in_commit(conn, project_id, commit_sha)
 
         # 6. Mark ready
         await conn.execute(
@@ -121,7 +144,7 @@ async def _index_repo(project_id: str, repo_url: str | None) -> None:
             """,
             project_id,
         )
-        print(f"[indexer] done — project {project_id} marked ready")
+        print(f"[indexer] done — project {project_id} marked ready @ {commit_sha[:8]}")
 
     except Exception as e:
         print(f"[indexer] error indexing {project_id}: {e}")

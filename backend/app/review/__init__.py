@@ -15,6 +15,12 @@ from app.review.bedrock_client import (
     ChatResponse,
     get_bedrock_client,
 )
+from app.review.context_builder import (
+    DEFAULT_CONTEXT_BUDGET_TOKENS,
+    DEFAULT_SEMANTIC_TOP_K,
+    ContextChunk,
+    build_context,
+)
 from app.review.diff_parser import (
     DIFF_CONTEXT_LINES,
     CommitInfo,
@@ -36,4 +42,9 @@ __all__ = [
     "DiffHunk",
     "commits_between",
     "diff_between",
+    # context
+    "ContextChunk",
+    "DEFAULT_CONTEXT_BUDGET_TOKENS",
+    "DEFAULT_SEMANTIC_TOP_K",
+    "build_context",
 ]

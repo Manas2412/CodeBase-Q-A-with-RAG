@@ -15,11 +15,25 @@ from app.review.bedrock_client import (
     ChatResponse,
     get_bedrock_client,
 )
+from app.review.diff_parser import (
+    DIFF_CONTEXT_LINES,
+    CommitInfo,
+    DiffHunk,
+    commits_between,
+    diff_between,
+)
 
 __all__ = [
+    # bedrock
     "MAX_OUTPUT_TOKENS",
     "BedrockClient",
     "BedrockError",
     "ChatResponse",
     "get_bedrock_client",
+    # diff
+    "DIFF_CONTEXT_LINES",
+    "CommitInfo",
+    "DiffHunk",
+    "commits_between",
+    "diff_between",
 ]

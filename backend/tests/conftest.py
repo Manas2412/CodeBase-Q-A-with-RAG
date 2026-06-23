@@ -140,3 +140,78 @@ def temp_repos_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """
     monkeypatch.setenv("CODEREVIEW_REPOS_DIR", str(tmp_path))
     return tmp_path
+
+
+# ── Synthetic repo with diverse diff shapes ───────────────────────────────
+@pytest.fixture
+def diff_repo(tmp_path: Path) -> tuple[Path, str, str]:
+    """Two-commit repo exercising every change type the diff parser cares about.
+
+    Returns (repo_path, before_sha, after_sha).
+
+    Commit 1 (before):
+      kept.py        — touched-but-not-modified across the diff
+      to_modify.py   — body changes between commits
+      to_delete.py   — removed in commit 2
+      to_rename.py   — renamed (and slightly modified) in commit 2
+
+    Commit 2 (after):
+      added.py       — newly created
+      to_modify.py   — modified contents
+      to_delete.py   — gone
+      renamed.py     — was to_rename.py
+    """
+    repo = tmp_path / "diff-repo"
+    repo.mkdir()
+
+    _git("git", "init", "-q", "-b", "main", cwd=repo)
+    _git("git", "config", "user.email", "alice@example.invalid", cwd=repo)
+    _git("git", "config", "user.name", "Alice Reviewer", cwd=repo)
+    _git("git", "config", "commit.gpgsign", "false", cwd=repo)
+
+    # ── Commit 1: baseline ──
+    (repo / "kept.py").write_text("def kept():\n    return 1\n")
+    (repo / "to_modify.py").write_text(
+        "def old_name():\n    # legacy implementation\n    return 'old'\n"
+    )
+    (repo / "to_delete.py").write_text(
+        "# soon-to-be-removed module\nDOOMED = True\n"
+    )
+    (repo / "to_rename.py").write_text(
+        "def staying_around():\n    pass\n"
+    )
+    _git("git", "add", ".", cwd=repo)
+    _git("git", "commit", "-q", "-m", "initial baseline", cwd=repo)
+
+    before = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # ── Commit 2: add + modify + delete + rename ──
+    (repo / "added.py").write_text("def added():\n    return 'new'\n")
+    (repo / "to_modify.py").write_text(
+        "def new_name():\n    # rewritten implementation\n    return 'updated'\n"
+    )
+    (repo / "to_delete.py").unlink()
+    # Pure rename — content stays identical so git's rename detector
+    # (default threshold ~50% similarity) classifies this unambiguously
+    # as a rename. The previous fixture tweaked the file slightly which
+    # pushed similarity right to the 50% threshold and tipped the
+    # classifier into "added" territory.
+    _git("git", "mv", "to_rename.py", "renamed.py", cwd=repo)
+    _git("git", "add", "-A", cwd=repo)
+    _git("git", "commit", "-q", "-m", "diverse changes", cwd=repo)
+
+    after = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    return repo, before, after

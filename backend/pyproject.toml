@@ -31,6 +31,7 @@ dependencies = [
     # Git providers (Phase 1: OpenForge + GitHub via abstraction)
     "PyGithub>=2.3",
     "gitpython>=3.1",
+    "unidiff>=0.7",   # parses `git diff` output into structured PatchSet/Hunk objects
 
     # AWS Bedrock client — replaces Voyage / Cohere / Ollama / Anthropic SDK.
     # Used for both LLM (Claude Opus 4.6) and embeddings (Cohere Embed v3).

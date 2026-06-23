@@ -4,11 +4,13 @@ import uuid
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 
+import asyncio
 import asyncpg
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.db.database import needs_ssl
@@ -136,6 +138,65 @@ class CreateProjectResponse(BaseModel):
     default_branch: str
     branches_to_review: list[str]
     created: bool  # True for fresh inserts, False if the URL was already registered
+
+
+class ProjectOut(BaseModel):
+    """Project as it appears in list / detail responses."""
+
+    id: str
+    provider: str
+    name: str
+    repo_url: str
+    default_branch: str
+    branches_to_review: list[str]
+    last_reviewed_sha: dict
+    trigger_mode: str
+    poll_interval_minutes: int
+    auto_watch_new: bool
+    checklist_id: str | None
+    status: str
+    indexed_at: str | None
+    last_polled_at: str | None
+    created_at: str
+
+
+class ProjectListResponse(BaseModel):
+    projects: list[ProjectOut]
+    total: int
+    limit: int
+    offset: int
+
+
+# Columns used by both list and detail endpoints — keep the SELECT identical
+# so the row → ProjectOut mapping in `_row_to_project` matches.
+_PROJECT_COLUMNS = """
+    id, provider, name, repo_url, default_branch, branches_to_review,
+    last_reviewed_sha, trigger_mode, poll_interval_minutes, auto_watch_new,
+    checklist_id, status, indexed_at, last_polled_at, created_at
+"""
+
+
+def _row_to_project(row: asyncpg.Record) -> ProjectOut:
+    """Map an asyncpg Record to ProjectOut, normalising types for JSON."""
+    return ProjectOut(
+        id=str(row["id"]),
+        provider=row["provider"],
+        name=row["name"],
+        repo_url=row["repo_url"],
+        default_branch=row["default_branch"],
+        branches_to_review=row["branches_to_review"] or [],
+        last_reviewed_sha=row["last_reviewed_sha"] or {},
+        trigger_mode=row["trigger_mode"],
+        poll_interval_minutes=row["poll_interval_minutes"],
+        auto_watch_new=row["auto_watch_new"],
+        checklist_id=str(row["checklist_id"]) if row["checklist_id"] else None,
+        status=row["status"],
+        indexed_at=row["indexed_at"].isoformat() if row["indexed_at"] else None,
+        last_polled_at=(
+            row["last_polled_at"].isoformat() if row["last_polled_at"] else None
+        ),
+        created_at=row["created_at"].isoformat(),
+    )
 
 
 def _detect_provider(url: str) -> str:
@@ -302,6 +363,149 @@ async def create_project(body: CreateProjectRequest):
         default_branch=default_branch,
         branches_to_review=branches_to_review,
         created=True,
+    )
+
+
+@app.get("/projects", response_model=ProjectListResponse)
+async def list_projects(
+    limit: int = Query(50, ge=1, le=100, description="Max rows to return"),
+    offset: int = Query(0, ge=0, description="Skip the first N rows"),
+    provider: str | None = Query(None, description="Filter by provider name"),
+):
+    """List registered projects ordered by most recently created.
+
+    Used by the dashboard's projects list view. Pagination keeps the
+    payload bounded — the frontend can render 'load more' or pages.
+    """
+    where = ""
+    params: list = []
+    if provider:
+        params.append(provider)
+        where = f"WHERE provider = ${len(params)}"
+
+    params.extend([limit, offset])
+    limit_param = f"${len(params) - 1}"
+    offset_param = f"${len(params)}"
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""
+            SELECT {_PROJECT_COLUMNS}
+            FROM projects
+            {where}
+            ORDER BY created_at DESC
+            LIMIT {limit_param} OFFSET {offset_param}
+            """,
+            *params,
+        )
+        total_params = [provider] if provider else []
+        total = await conn.fetchval(
+            f"SELECT COUNT(*) FROM projects {where}",
+            *total_params,
+        )
+
+    return ProjectListResponse(
+        projects=[_row_to_project(r) for r in rows],
+        total=total or 0,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/projects/{project_id}", response_model=ProjectOut)
+async def get_project(project_id: str):
+    """Project detail by ID. 404 if not found."""
+    try:
+        pid = uuid.UUID(project_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="project_id must be a UUID")
+
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            f"SELECT {_PROJECT_COLUMNS} FROM projects WHERE id = $1", pid
+        )
+    if not row:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return _row_to_project(row)
+
+
+@app.get("/projects/{project_id}/index-status")
+async def project_index_status_stream(project_id: str):
+    """Live SSE stream of indexing progress for wizard Screen 4.
+
+    Polls the projects table once a second, emits an SSE `data:` event
+    whenever the status field changes, and closes the stream when the
+    status becomes terminal (`ready` or `error`).
+
+    The frontend can render a check-mark per step (cloning → chunking →
+    embedding → ready) by reading successive events. Status values today:
+    pending, indexing, ready, error. More granular sub-steps land in Week 2
+    once the Bedrock embedder reports phases.
+    """
+    try:
+        pid = uuid.UUID(project_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="project_id must be a UUID")
+
+    # Verify the project exists before we start streaming
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM projects WHERE id = $1", pid
+        )
+    if not exists:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    terminal_states = {"ready", "error"}
+
+    async def event_stream():
+        import json as _json
+
+        last_payload: str | None = None
+        # Cap the stream at 10 minutes — indexing should never take that long
+        # for a single repo, and we don't want zombie connections lingering.
+        deadline = asyncio.get_event_loop().time() + 600
+
+        while asyncio.get_event_loop().time() < deadline:
+            async with db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT status, indexed_at FROM projects WHERE id = $1", pid
+                )
+            if not row:
+                yield 'event: error\ndata: {"error":"project deleted"}\n\n'
+                return
+
+            payload = _json.dumps(
+                {
+                    "status": row["status"],
+                    "indexed_at": (
+                        row["indexed_at"].isoformat() if row["indexed_at"] else None
+                    ),
+                }
+            )
+
+            # Only emit when something actually changed — saves bandwidth
+            # and lets the frontend treat each event as a meaningful update.
+            if payload != last_payload:
+                yield f"data: {payload}\n\n"
+                last_payload = payload
+
+            if row["status"] in terminal_states:
+                yield "event: done\ndata: [DONE]\n\n"
+                return
+
+            await asyncio.sleep(1)
+
+        # Timed out without reaching terminal state — close cleanly so the
+        # client knows to retry or treat it as stuck.
+        yield 'event: timeout\ndata: {"error":"stream timed out"}\n\n'
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx/proxy buffering
+        },
     )
 
 

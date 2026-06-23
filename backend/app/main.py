@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from app.db.database import needs_ssl
+from app.db.database import needs_ssl, register_jsonb_codecs
 from app.providers import (
     ProviderError,
     UnknownProviderError,
@@ -38,27 +38,6 @@ def get_dsn() -> str:
     return db_url.split("?")[0]
 
 
-async def _init_asyncpg_connection(conn: asyncpg.Connection) -> None:
-    """Register codecs on every pool connection.
-
-    Without this, asyncpg returns JSONB columns as raw strings — Pydantic
-    then chokes when we feed them straight into list[str]/dict-typed
-    fields. With the codec, JSONB round-trips as Python lists / dicts.
-    """
-    await conn.set_type_codec(
-        "jsonb",
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema="pg_catalog",
-    )
-    await conn.set_type_codec(
-        "json",
-        encoder=json.dumps,
-        decoder=json.loads,
-        schema="pg_catalog",
-    )
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool, redis_pool
@@ -67,7 +46,7 @@ async def lifespan(app: FastAPI):
     db_pool = await asyncpg.create_pool(
         dsn,
         ssl=needs_ssl(dsn),
-        init=_init_asyncpg_connection,
+        init=register_jsonb_codecs,
     )
 
     redis_pool = aioredis.from_url(
@@ -165,6 +144,172 @@ class ProjectListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+# ── Review read models ──────────────────────────────────────────────────
+#
+# Shape note: list endpoints return summary fields only (cheap query); detail
+# endpoints add commits[] and the summary blob. Splitting these keeps the
+# dashboard's reviews-list page snappy when projects accumulate hundreds of
+# reviews.
+
+class ReviewSummary(BaseModel):
+    """Lightweight row in a reviews list — no `summary` text, no joined commits."""
+
+    id: str
+    project_id: str
+    branch: str
+    before_sha: str
+    after_sha: str
+    status: str
+    severity_counts: dict
+    token_usage: dict
+    checklist_version: int | None
+    batch_mode: str
+    created_at: str
+    completed_at: str | None
+    #: Derived count of findings on this review. Cheap via the index on
+    #: review_findings(review_id). The dashboard uses this for the "N issues"
+    #: badge without paying for a JOIN against the full findings table.
+    finding_count: int
+
+
+class ReviewListResponse(BaseModel):
+    reviews: list[ReviewSummary]
+    total: int
+    limit: int
+    offset: int
+
+
+class CommitOut(BaseModel):
+    """A reviewed commit's full attribution + subject."""
+
+    sha: str
+    parent_sha: str | None
+    branch: str
+    author_name: str
+    author_email: str
+    committer_name: str
+    committer_email: str
+    committed_at: str
+    subject: str
+    source: str
+
+
+class ReviewDetail(ReviewSummary):
+    """Single-review payload — adds the natural-language summary + commit list."""
+
+    summary: str | None
+    commits: list[CommitOut]
+
+
+class FindingOut(BaseModel):
+    id: str
+    review_id: str
+    commit_id: str | None
+    severity: str
+    category: str
+    file_path: str
+    start_line: int | None
+    end_line: int | None
+    message: str
+    suggestion: str | None
+    rule_id: str | None
+
+
+class FindingListResponse(BaseModel):
+    findings: list[FindingOut]
+    total: int
+    limit: int
+    offset: int
+
+
+class CommitListResponse(BaseModel):
+    commits: list[CommitOut]
+    total: int
+    limit: int
+    offset: int
+
+
+#: Severity ordering used everywhere a severity sort matters — critical first.
+#: Postgres CASE expressions reference this list by index; keep in sync if you
+#: add a level.
+SEVERITY_ORDER: list[str] = ["critical", "major", "minor", "info"]
+
+
+def _row_to_review_summary(row: asyncpg.Record) -> ReviewSummary:
+    return ReviewSummary(
+        id=str(row["id"]),
+        project_id=str(row["project_id"]),
+        branch=row["branch"],
+        before_sha=row["before_sha"],
+        after_sha=row["after_sha"],
+        status=row["status"],
+        severity_counts=row["severity_counts"] or {},
+        token_usage=row["token_usage"] or {},
+        checklist_version=row["checklist_version"],
+        batch_mode=row["batch_mode"],
+        created_at=row["created_at"].isoformat(),
+        completed_at=(
+            row["completed_at"].isoformat() if row["completed_at"] else None
+        ),
+        finding_count=row["finding_count"],
+    )
+
+
+def _row_to_commit(row: asyncpg.Record) -> CommitOut:
+    return CommitOut(
+        sha=row["sha"],
+        parent_sha=row["parent_sha"],
+        branch=row["branch"],
+        author_name=row["author_name"],
+        author_email=row["author_email"],
+        committer_name=row["committer_name"],
+        committer_email=row["committer_email"],
+        committed_at=row["committed_at"].isoformat(),
+        subject=row["subject"],
+        source=row["source"],
+    )
+
+
+def _row_to_finding(row: asyncpg.Record) -> FindingOut:
+    return FindingOut(
+        id=str(row["id"]),
+        review_id=str(row["review_id"]),
+        commit_id=str(row["commit_id"]) if row["commit_id"] else None,
+        severity=row["severity"],
+        category=row["category"],
+        file_path=row["file_path"],
+        start_line=row["start_line"],
+        end_line=row["end_line"],
+        message=row["message"],
+        suggestion=row["suggestion"],
+        rule_id=row["rule_id"],
+    )
+
+
+#: Review columns used by both list and detail. `finding_count` is a
+#: correlated subquery — cheap with the existing index on review_findings(review_id).
+#:
+#: Note: commit-to-review attribution (which commits "belong" to this push range)
+#: is deferred to Day 5, which adds a `commits.review_id` FK. Until then the
+#: detail endpoint surfaces recent commits on the branch as a soft approximation.
+_REVIEW_SUMMARY_COLUMNS = """
+    r.id, r.project_id, r.branch, r.before_sha, r.after_sha, r.status,
+    r.severity_counts, r.token_usage, r.checklist_version, r.batch_mode,
+    r.created_at, r.completed_at,
+    (SELECT COUNT(*) FROM review_findings f WHERE f.review_id = r.id) AS finding_count
+"""
+
+
+def _parse_uuid(s: str, *, field: str) -> uuid.UUID:
+    """Validate a path/query string is a UUID. 400 on failure with a useful field name."""
+    try:
+        return uuid.UUID(s)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail=f"{field} must be a UUID"
+        )
 
 
 # Columns used by both list and detail endpoints — keep the SELECT identical
@@ -552,6 +697,316 @@ async def probe_project(body: ProbeRequest):
             BranchOut(name=b.name, sha=b.sha, is_default=b.is_default)
             for b in branches
         ],
+    )
+
+
+# ── Review read endpoints ───────────────────────────────────────────────
+#
+# Three dashboard-facing endpoints, all read-only:
+#   GET /projects/{id}/reviews        — paginated list per project
+#   GET /reviews/{id}                  — single review + commit attribution
+#   GET /reviews/{id}/findings         — paginated findings, filterable
+# Plus an audit log helper:
+#   GET /projects/{id}/commits         — every reviewed commit on a project
+#
+# Design choices:
+#   • Filters as query params, not path segments — the dashboard composes
+#     URLs as `/projects/X/reviews?branch=dev&status=done`, which is
+#     bookmarkable.
+#   • Severity sort uses a CASE in SQL, not Python — keeps pagination cursors
+#     stable across pages.
+#   • Pagination via limit + offset (not cursor-based) — adequate at Phase 1
+#     volumes (<10K reviews per project). Switch to keyset if it ever matters.
+#   • Counts come from COUNT(*) with the same WHERE clause as the SELECT —
+#     correct for any filter combination.
+
+@app.get("/projects/{project_id}/reviews", response_model=ReviewListResponse)
+async def list_project_reviews(
+    project_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    branch: str | None = Query(None, description="Filter by branch name"),
+    status: str | None = Query(
+        None, description="Filter by review status (pending/running/done/error)"
+    ),
+):
+    """List reviews for a project, newest first.
+
+    Returns summary fields only — no `summary` blob, no joined commits.
+    The dashboard's reviews-list view paints this directly.
+    """
+    pid = _parse_uuid(project_id, field="project_id")
+
+    where_parts = ["r.project_id = $1"]
+    params: list = [pid]
+    if branch:
+        params.append(branch)
+        where_parts.append(f"r.branch = ${len(params)}")
+    if status:
+        params.append(status)
+        where_parts.append(f"r.status = ${len(params)}")
+    where_sql = "WHERE " + " AND ".join(where_parts)
+
+    list_params = [*params, limit, offset]
+    limit_p = f"${len(list_params) - 1}"
+    offset_p = f"${len(list_params)}"
+
+    async with db_pool.acquire() as conn:
+        # Existence check first — distinguishes "no reviews yet" (200, [])
+        # from "no such project" (404). Otherwise an unknown UUID would
+        # silently return an empty list, masking client bugs.
+        exists = await conn.fetchval(
+            "SELECT 1 FROM projects WHERE id = $1", pid
+        )
+        if not exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        rows = await conn.fetch(
+            f"""
+            SELECT {_REVIEW_SUMMARY_COLUMNS}
+              FROM reviews r
+              {where_sql}
+             ORDER BY r.created_at DESC
+             LIMIT {limit_p} OFFSET {offset_p}
+            """,
+            *list_params,
+        )
+        total = await conn.fetchval(
+            f"SELECT COUNT(*) FROM reviews r {where_sql}", *params
+        )
+
+    return ReviewListResponse(
+        reviews=[_row_to_review_summary(r) for r in rows],
+        total=total or 0,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/reviews/{review_id}", response_model=ReviewDetail)
+async def get_review(review_id: str):
+    """Single review with full `summary` blob + commit attribution.
+
+    `commits[]` is the list of commits on the same branch that landed at or
+    before this review's created_at, going back to either the previous
+    review or 30 days, whichever is closer. This is a soft approximation
+    until Day 5 introduces a `commits.review_id` FK for hard attribution.
+    """
+    rid = _parse_uuid(review_id, field="review_id")
+
+    async with db_pool.acquire() as conn:
+        review_row = await conn.fetchrow(
+            f"""
+            SELECT {_REVIEW_SUMMARY_COLUMNS}, r.summary
+              FROM reviews r
+             WHERE r.id = $1
+            """,
+            rid,
+        )
+        if not review_row:
+            raise HTTPException(status_code=404, detail="Review not found")
+
+        # Find the previous review on the same branch — this review's commits
+        # are the ones committed AFTER that boundary. If there's no previous
+        # review (this is the first), fall back to a 30-day window.
+        prev_review_created = await conn.fetchval(
+            """
+            SELECT created_at FROM reviews
+             WHERE project_id = $1
+               AND branch     = $2
+               AND created_at < $3
+             ORDER BY created_at DESC
+             LIMIT 1
+            """,
+            review_row["project_id"],
+            review_row["branch"],
+            review_row["created_at"],
+        )
+        # `interval '30 days'` is a soft cap — keeps the first-review case
+        # from returning the project's entire git history.
+        if prev_review_created is None:
+            commit_rows = await conn.fetch(
+                """
+                SELECT sha, parent_sha, branch, author_name, author_email,
+                       committer_name, committer_email, committed_at,
+                       subject, source
+                  FROM commits
+                 WHERE project_id = $1
+                   AND branch     = $2
+                   AND committed_at <= $3
+                   AND committed_at >  ($3::timestamptz - interval '30 days')
+                 ORDER BY committed_at DESC
+                """,
+                review_row["project_id"],
+                review_row["branch"],
+                review_row["created_at"],
+            )
+        else:
+            commit_rows = await conn.fetch(
+                """
+                SELECT sha, parent_sha, branch, author_name, author_email,
+                       committer_name, committer_email, committed_at,
+                       subject, source
+                  FROM commits
+                 WHERE project_id = $1
+                   AND branch     = $2
+                   AND committed_at >  $3
+                   AND committed_at <= $4
+                 ORDER BY committed_at DESC
+                """,
+                review_row["project_id"],
+                review_row["branch"],
+                prev_review_created,
+                review_row["created_at"],
+            )
+
+    summary = _row_to_review_summary(review_row)
+    return ReviewDetail(
+        **summary.model_dump(),
+        summary=review_row["summary"],
+        commits=[_row_to_commit(r) for r in commit_rows],
+    )
+
+
+@app.get("/reviews/{review_id}/findings", response_model=FindingListResponse)
+async def list_review_findings(
+    review_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    severity: list[str] | None = Query(
+        None, description="Filter by severity. Repeat the param for multi-select."
+    ),
+    category: list[str] | None = Query(
+        None, description="Filter by category. Repeat the param for multi-select."
+    ),
+    file_path: str | None = Query(
+        None, description="Substring match on file_path (case-insensitive)"
+    ),
+):
+    """Findings for one review, ordered critical → info, then by file/line.
+
+    Filters compose: severity ∈ {...} AND category ∈ {...} AND file_path
+    ILIKE %...%. An empty filter list means "no filter on that field".
+    """
+    rid = _parse_uuid(review_id, field="review_id")
+
+    where_parts = ["f.review_id = $1"]
+    params: list = [rid]
+    if severity:
+        params.append(severity)
+        where_parts.append(f"f.severity = ANY(${len(params)}::text[])")
+    if category:
+        params.append(category)
+        where_parts.append(f"f.category = ANY(${len(params)}::text[])")
+    if file_path:
+        params.append(f"%{file_path}%")
+        where_parts.append(f"f.file_path ILIKE ${len(params)}")
+    where_sql = "WHERE " + " AND ".join(where_parts)
+
+    list_params = [*params, limit, offset]
+    limit_p = f"${len(list_params) - 1}"
+    offset_p = f"${len(list_params)}"
+
+    async with db_pool.acquire() as conn:
+        # 404 for unknown review_id, same reasoning as the projects endpoint.
+        exists = await conn.fetchval(
+            "SELECT 1 FROM reviews WHERE id = $1", rid
+        )
+        if not exists:
+            raise HTTPException(status_code=404, detail="Review not found")
+
+        rows = await conn.fetch(
+            f"""
+            SELECT f.id, f.review_id, f.commit_id, f.severity, f.category,
+                   f.file_path, f.start_line, f.end_line, f.message,
+                   f.suggestion, f.rule_id
+              FROM review_findings f
+              {where_sql}
+             ORDER BY CASE f.severity
+                        WHEN 'critical' THEN 0
+                        WHEN 'major'    THEN 1
+                        WHEN 'minor'    THEN 2
+                        WHEN 'info'     THEN 3
+                        ELSE 4
+                      END,
+                      f.file_path,
+                      f.start_line NULLS LAST
+             LIMIT {limit_p} OFFSET {offset_p}
+            """,
+            *list_params,
+        )
+        total = await conn.fetchval(
+            f"SELECT COUNT(*) FROM review_findings f {where_sql}", *params
+        )
+
+    return FindingListResponse(
+        findings=[_row_to_finding(r) for r in rows],
+        total=total or 0,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@app.get("/projects/{project_id}/commits", response_model=CommitListResponse)
+async def list_project_commits(
+    project_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+    branch: str | None = Query(None, description="Filter by branch"),
+    author_email: str | None = Query(
+        None, description="Exact match on author_email"
+    ),
+):
+    """Audit log — every reviewed commit on a project.
+
+    This is the full attribution trail: who pushed what, when, on which
+    branch, and via which trigger (poll/webhook/manual). Useful for the
+    dashboard's "activity" view and for compliance audits.
+    """
+    pid = _parse_uuid(project_id, field="project_id")
+
+    where_parts = ["c.project_id = $1"]
+    params: list = [pid]
+    if branch:
+        params.append(branch)
+        where_parts.append(f"c.branch = ${len(params)}")
+    if author_email:
+        params.append(author_email)
+        where_parts.append(f"c.author_email = ${len(params)}")
+    where_sql = "WHERE " + " AND ".join(where_parts)
+
+    list_params = [*params, limit, offset]
+    limit_p = f"${len(list_params) - 1}"
+    offset_p = f"${len(list_params)}"
+
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM projects WHERE id = $1", pid
+        )
+        if not exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        rows = await conn.fetch(
+            f"""
+            SELECT c.sha, c.parent_sha, c.branch, c.author_name, c.author_email,
+                   c.committer_name, c.committer_email, c.committed_at,
+                   c.subject, c.source
+              FROM commits c
+              {where_sql}
+             ORDER BY c.committed_at DESC
+             LIMIT {limit_p} OFFSET {offset_p}
+            """,
+            *list_params,
+        )
+        total = await conn.fetchval(
+            f"SELECT COUNT(*) FROM commits c {where_sql}", *params
+        )
+
+    return CommitListResponse(
+        commits=[_row_to_commit(r) for r in rows],
+        total=total or 0,
+        limit=limit,
+        offset=offset,
     )
 
 

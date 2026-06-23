@@ -214,3 +214,43 @@ async def test_embed_query_uses_search_query_input_type():
     body = json.loads(client.invoke_model.call_args.kwargs["body"])
     assert body["input_type"] == "search_query"
     assert body["texts"] == ["how does the polling agent work?"]
+
+
+@pytest.mark.asyncio
+async def test_embed_query_truncates_oversized_input():
+    """Regression: a real diff's joined `added_lines` easily exceeds 2048
+    chars. Cohere returns ValidationException above the cap, so embed_query
+    must truncate at the boundary just like embed_chunks does.
+
+    The bug that surfaced this: context_builder.build_context joined every
+    added line across hunks into a single embed_query call (~6000 chars
+    for a normal feature commit), which Bedrock rejected outright —
+    poisoning every poll's review_push_task.
+    """
+    oversized = "added line " * 500  # ~6000 chars, well over 2048
+    assert len(oversized) > COHERE_EMBED_MAX_CHARS
+
+    client = _make_embed_mock(vectors_per_call=1)
+    bc = BedrockClient(client=client)
+
+    vector = await embed_query(oversized, client=bc)
+
+    assert len(vector) == 1024
+    body = json.loads(client.invoke_model.call_args.kwargs["body"])
+    sent_text = body["texts"][0]
+    assert len(sent_text) == COHERE_EMBED_MAX_CHARS
+    # Head survives (highest-signal bit for ANN)
+    assert sent_text.startswith("added line ")
+
+
+@pytest.mark.asyncio
+async def test_embed_query_leaves_short_input_untouched():
+    """Below the cap → passed through verbatim."""
+    short = "diff context: refactor handler"
+    client = _make_embed_mock(vectors_per_call=1)
+    bc = BedrockClient(client=client)
+
+    await embed_query(short, client=bc)
+
+    body = json.loads(client.invoke_model.call_args.kwargs["body"])
+    assert body["texts"] == [short]

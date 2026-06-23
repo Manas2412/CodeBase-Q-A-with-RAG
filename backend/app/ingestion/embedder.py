@@ -121,7 +121,21 @@ async def embed_query(
     Used at retrieval time. The different input_type tells Cohere this is
     a query, not a document — and the resulting embedding lives in the
     query side of the search space.
+
+    Truncates to COHERE_EMBED_MAX_CHARS (2048) for the same reason as
+    `_chunk_text` — Cohere returns ValidationException above that limit.
+    For a real diff with many added lines (e.g. a feature commit), the
+    joined query text can easily run past 2K chars. The head of the text
+    is the highest-signal part for ANN, so tail-truncate.
     """
+    if len(text) > COHERE_EMBED_MAX_CHARS:
+        log.info(
+            "embedder: truncating query (%d → %d chars)",
+            len(text),
+            COHERE_EMBED_MAX_CHARS,
+        )
+        text = text[:COHERE_EMBED_MAX_CHARS]
+
     bc = client or get_bedrock_client()
     result = await bc.embed([text], input_type="search_query")
     return result[0]

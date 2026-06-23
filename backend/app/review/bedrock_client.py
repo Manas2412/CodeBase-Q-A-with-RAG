@@ -1,22 +1,28 @@
 """Async wrapper around AWS Bedrock for the review pipeline.
 
 Two operations the pipeline uses:
-  • chat()  → Claude Opus 4.6 via the Converse API for review generation
-  • embed() → Cohere Embed Multilingual v3 via InvokeModel for indexing
-              and query embeddings
+  • chat()  → Claude Opus 4.6 via `invoke_model` + Anthropic Messages API
+  • embed() → Cohere Embed Multilingual v3 via `invoke_model`
 
-Design notes:
+Why `invoke_model` + Anthropic format instead of the newer Converse API:
+  • Wider compatibility — older API, fewer rollout gaps across regions.
+  • First-class support for Bedrock prompt caching via
+    `cache_control: {"type": "ephemeral"}` blocks — gives a 90% discount
+    on the cached input tokens, which is significant for the review
+    pipeline where the checklist prefix repeats across every call.
+  • Matches the pattern already proven in our other production Bedrock
+    project (PQ-Panel) — same call shape, same error envelope.
+
+Other design notes:
   • max_tokens is a module-level constant (MAX_OUTPUT_TOKENS = 16384),
-    NOT an env var. Bedrock charges per actual output, so a high ceiling
-    is free — it just prevents review truncation on large diffs.
-    Plan v3.3 §4 covers the rationale.
+    NOT an env var. Bedrock bills on actual output, so a high ceiling is
+    free — it just prevents review truncation on big diffs. Plan v3.3 §4.
   • boto3 is synchronous; we marshal calls onto a thread via
     asyncio.to_thread() so async callers can await them.
-  • Retries: exponential backoff with jitter on the known-transient
-    Bedrock error codes (ThrottlingException, ServiceUnavailableException,
-    InternalServerException).
-  • Embeddings: Cohere's Bedrock API caps at 96 texts per call. We enforce
-    the cap and let the caller batch.
+  • Retries: exponential backoff with jitter on known-transient Bedrock
+    error codes (Throttling, ServiceUnavailable, InternalServer, etc.).
+  • Embed batch cap: Cohere's Bedrock API rejects >96 texts per call.
+    We enforce the cap and let the caller batch upstream.
 """
 
 from __future__ import annotations
@@ -33,7 +39,7 @@ from botocore.exceptions import ClientError
 
 
 # ── Constants ────────────────────────────────────────────────────────────
-#: Output cap for every Converse call. See plan §4.1, §4.3.
+#: Default output cap for every chat() call. Plan §4.1, §4.3.
 MAX_OUTPUT_TOKENS: int = 16384
 
 #: Cohere Embed Multilingual v3 hard limit per InvokeModel call.
@@ -42,6 +48,9 @@ EMBED_BATCH_LIMIT: int = 96
 DEFAULT_LLM_MODEL = "us.anthropic.claude-opus-4-6-v1"
 DEFAULT_EMBED_MODEL = "cohere.embed-multilingual-v3"
 DEFAULT_REGION = "us-east-1"
+
+#: Required `anthropic_version` field on Bedrock-hosted Claude calls.
+ANTHROPIC_BEDROCK_VERSION = "bedrock-2023-05-31"
 
 # Bedrock error codes we treat as transient and retry.
 _RETRYABLE_ERRORS: set[str] = {
@@ -59,13 +68,20 @@ class BedrockError(Exception):
 
 @dataclass(frozen=True)
 class ChatResponse:
-    """Structured Converse reply with token usage attached."""
+    """Structured Anthropic Messages reply with token usage attached.
+
+    `cache_read_tokens` + `cache_creation_tokens` are populated when
+    prompt caching is in play (`cache_prefix` was passed to chat()).
+    They're 0 otherwise.
+    """
 
     text: str
     input_tokens: int
     output_tokens: int
     total_tokens: int
     stop_reason: str
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
 
 # ── Backoff helper ───────────────────────────────────────────────────────
@@ -80,13 +96,9 @@ async def _with_backoff(
 ) -> T:
     """Run a sync boto3 call in a worker thread with exponential backoff.
 
-    Sleeps `base_delay * 2**attempt * (0.5 + random)` between retries — the
-    jitter prevents thundering-herd retries when many workers hit the same
-    Bedrock rate limit at once.
-
-    Non-retryable errors raise BedrockError immediately. Retryable errors
-    that still fail after `max_attempts` also raise BedrockError, carrying
-    the last underlying ClientError as `__cause__`.
+    Non-retryable codes raise BedrockError immediately. Retryable codes
+    that still fail after `max_attempts` also raise BedrockError, with
+    the last underlying ClientError attached as `__cause__`.
     """
     last_error: ClientError | None = None
     for attempt in range(max_attempts):
@@ -136,65 +148,138 @@ class BedrockClient:
 
     @property
     def client(self) -> Any:
+        """Lazy-construct the boto3 bedrock-runtime client.
+
+        Credentials are read from env (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+        if present and passed explicitly to boto3 — mirrors the pattern used in
+        our sibling PQ-Bot production service. If the env vars aren't set,
+        boto3 falls through to its standard credential chain (IAM role on
+        EC2/ECS, ~/.aws/credentials, etc.), so this works in containers too.
+        """
         if self._client is None:
-            self._client = boto3.client("bedrock-runtime", region_name=self.region)
+            client_kwargs: dict[str, Any] = {"region_name": self.region}
+            ak = os.getenv("AWS_ACCESS_KEY_ID")
+            sk = os.getenv("AWS_SECRET_ACCESS_KEY")
+            if ak and sk:
+                client_kwargs["aws_access_key_id"] = ak
+                client_kwargs["aws_secret_access_key"] = sk
+            self._client = boto3.client("bedrock-runtime", **client_kwargs)
         return self._client
 
-    # ── Chat (Converse) ─────────────────────────────────────────────────
+    # ── Chat (invoke_model + Anthropic Messages API) ─────────────────────
     async def chat(
         self,
         messages: list[dict],
         *,
         max_tokens: int = MAX_OUTPUT_TOKENS,
         temperature: float = 0.0,
-        system: str | list[dict] | None = None,
+        system: str | None = None,
+        cache_prefix: str | None = None,
     ) -> ChatResponse:
-        """Call Bedrock Converse and return text + token usage.
+        """Call Bedrock with Anthropic Messages API; return text + token usage.
 
         Parameters
         ----------
         messages : list[dict]
-            Converse-format messages. Shape:
-                [{"role": "user", "content": [{"text": "..."}]}, ...]
+            Anthropic-format messages:
+                [{"role": "user", "content": [{"type": "text", "text": "..."}]}]
+            OR the short-hand form (we promote it):
+                [{"role": "user", "content": "..."}]
         max_tokens : int
             Output cap. Defaults to MAX_OUTPUT_TOKENS (16384).
         temperature : float
             0.0 for deterministic review output (recommended).
-        system : str | list[dict] | None
-            Optional system prompt. Plain string is wrapped to the
-            Converse-required [{"text": ...}] shape.
+        system : str | None
+            Optional system prompt. Inserted as top-level `system` field.
+        cache_prefix : str | None
+            If provided, the prefix is sent as a separate content block
+            with `cache_control: {"type": "ephemeral"}` so Bedrock caches
+            its tokens. Subsequent calls within the 5-minute TTL hit the
+            cache at 10% of input price (90% discount). Use for the
+            checklist + system block — anything that's identical across
+            many calls within the same review/poll cycle.
         """
-        kwargs: dict[str, Any] = {
-            "modelId": self.llm_model,
-            "messages": messages,
-            "inferenceConfig": {
-                "maxTokens": max_tokens,
-                "temperature": temperature,
-            },
+        # Build messages — promote simple strings into the typed-block shape
+        # so the rest of the body assembly is uniform.
+        normalised: list[dict] = []
+        for msg in messages:
+            content = msg.get("content")
+            if isinstance(content, str):
+                normalised.append(
+                    {"role": msg["role"], "content": [{"type": "text", "text": content}]}
+                )
+            else:
+                normalised.append(msg)
+
+        # If cache_prefix is set, splice it as the first content block of
+        # the first user message with cache_control marker. (Anthropic
+        # supports cache markers anywhere in content; we put it first so
+        # the cached prefix is at the start of the input.)
+        if cache_prefix and normalised:
+            first = normalised[0]
+            existing = first.get("content", [])
+            first["content"] = [
+                {
+                    "type": "text",
+                    "text": cache_prefix,
+                    "cache_control": {"type": "ephemeral"},
+                },
+                *existing,
+            ]
+
+        body: dict[str, Any] = {
+            "anthropic_version": ANTHROPIC_BEDROCK_VERSION,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": normalised,
         }
         if system is not None:
-            if isinstance(system, str):
-                kwargs["system"] = [{"text": system}]
-            else:
-                kwargs["system"] = system
+            body["system"] = system
 
-        response = await _with_backoff(lambda: self.client.converse(**kwargs))
+        body_json = json.dumps(body)
+
+        response = await _with_backoff(
+            lambda: self.client.invoke_model(
+                modelId=self.llm_model,
+                body=body_json,
+                contentType="application/json",
+                accept="application/json",
+            )
+        )
 
         try:
-            content = response["output"]["message"]["content"]
-            # Concatenate all text blocks — Converse can return tool-use or
-            # multiple text blocks; we just want the readable answer.
-            text = "".join(block.get("text", "") for block in content)
-        except (KeyError, TypeError, IndexError) as e:
-            raise BedrockError(f"Malformed Converse response: {response!r}") from e
+            payload = json.loads(response["body"].read())
+        except (KeyError, AttributeError, json.JSONDecodeError) as e:
+            raise BedrockError(f"Malformed invoke_model response: {response!r}") from e
 
-        usage = response.get("usage", {}) or {}
+        # Anthropic response shape:
+        #   {"id": ..., "type": "message", "role": "assistant",
+        #    "content": [{"type": "text", "text": "..."}],
+        #    "stop_reason": "end_turn",
+        #    "usage": {"input_tokens": N, "output_tokens": N,
+        #              "cache_creation_input_tokens": N,  # if cache write
+        #              "cache_read_input_tokens": N}}     # if cache hit
+        content_blocks = payload.get("content") or []
+        text = "".join(
+            b.get("text", "") for b in content_blocks if b.get("type") == "text"
+        )
+        if not isinstance(text, str):
+            raise BedrockError(f"Couldn't extract text from response: {payload!r}")
+
+        usage = payload.get("usage") or {}
+        input_tokens = int(usage.get("input_tokens", 0))
+        output_tokens = int(usage.get("output_tokens", 0))
+        cache_read = int(usage.get("cache_read_input_tokens", 0))
+        cache_creation = int(usage.get("cache_creation_input_tokens", 0))
+
         return ChatResponse(
             text=text,
-            input_tokens=int(usage.get("inputTokens", 0)),
-            output_tokens=int(usage.get("outputTokens", 0)),
-            total_tokens=int(usage.get("totalTokens", 0)),
-            stop_reason=str(response.get("stopReason", "")),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+            stop_reason=str(payload.get("stop_reason", "")),
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_creation,
         )
 
     # ── Embed (InvokeModel: Cohere Embed v3) ────────────────────────────

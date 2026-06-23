@@ -29,34 +29,48 @@ load_dotenv(BACKEND_ROOT / ".env")
 def mock_bedrock() -> MagicMock:
     """A MagicMock standing in for boto3's bedrock-runtime client.
 
-    Pre-shaped responses cover the two calls the review pipeline makes:
-      • converse() — returns a fake Claude reply
-      • invoke_model() — returns a fake 1024-dim Cohere embedding
+    `invoke_model` is the only Bedrock call we make (both chat and embed
+    go through it — chat with Anthropic Messages body, embed with Cohere
+    body). Pre-loaded with shaped responses so most tests don't need to
+    set return_value.
 
-    Tests can override return_value on the mock to simulate specific responses.
+    The mock dispatches on `modelId` keyword: anthropic.* → chat response,
+    cohere.* → embed response. Tests can override return_value or
+    side_effect to simulate specific cases.
     """
-    client = MagicMock(name="bedrock-runtime")
+    import json
+    from unittest.mock import MagicMock
 
-    # Default Converse response (Claude Opus shape)
-    client.converse.return_value = {
-        "output": {
-            "message": {
-                "role": "assistant",
-                "content": [{"text": "mocked review output"}],
-            }
+    # --- Pre-baked response payloads ----------------------------------
+    chat_payload = {
+        "id": "msg_test_001",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "mocked review output"}],
+        "stop_reason": "end_turn",
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
         },
-        "usage": {"inputTokens": 100, "outputTokens": 50, "totalTokens": 150},
-        "stopReason": "end_turn",
     }
+    embed_payload = {"embeddings": [[0.0] * 1024]}
 
-    # Default InvokeModel response (Cohere Embed v3 shape).
-    # Body is a stream-like object; tests typically call body.read().
-    embedding_stream = MagicMock()
-    embedding_stream.read.return_value = (
-        b'{"embeddings": [[' + b"0.0," * 1023 + b"0.0]]}"
-    )
-    client.invoke_model.return_value = {"body": embedding_stream}
+    def _stream_from(payload: dict) -> MagicMock:
+        s = MagicMock(name="body-stream")
+        s.read.return_value = json.dumps(payload).encode()
+        return s
 
+    def _invoke_model(modelId: str = "", **_: object) -> dict:
+        """Route to chat or embed payload based on the model id family."""
+        if modelId.startswith("cohere"):
+            return {"body": _stream_from(embed_payload)}
+        # anthropic.* (or anything else): assume a chat call
+        return {"body": _stream_from(chat_payload)}
+
+    client = MagicMock(name="bedrock-runtime")
+    client.invoke_model.side_effect = _invoke_model
     return client
 
 

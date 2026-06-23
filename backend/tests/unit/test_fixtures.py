@@ -1,23 +1,24 @@
 """Verify the conftest fixtures actually do what they claim."""
 
+import json
 from pathlib import Path
 
-import pytest
+
+def test_mock_bedrock_chat_returns_anthropic_shaped_response(mock_bedrock):
+    """An anthropic.* modelId routes to the chat payload (Anthropic Messages API)."""
+    response = mock_bedrock.invoke_model(modelId="us.anthropic.claude-opus-4-6-v1")
+    payload = json.loads(response["body"].read())
+    assert payload["type"] == "message"
+    assert payload["role"] == "assistant"
+    assert payload["content"][0]["type"] == "text"
+    assert payload["content"][0]["text"] == "mocked review output"
+    assert payload["stop_reason"] == "end_turn"
+    assert "usage" in payload
 
 
-def test_mock_bedrock_converse_returns_shaped_response(mock_bedrock):
-    """A test that wants Claude's reply gets a Claude-shaped dict back."""
-    response = mock_bedrock.converse(modelId="x", messages=[])
-    assert "output" in response
-    assert response["output"]["message"]["role"] == "assistant"
-    assert response["output"]["message"]["content"][0]["text"]
-
-
-def test_mock_bedrock_invoke_model_returns_embedding(mock_bedrock):
-    """A test that wants Cohere Embed v3 gets a body-with-read() response."""
-    import json
-
-    response = mock_bedrock.invoke_model(modelId="cohere.embed-multilingual-v3", body="{}")
+def test_mock_bedrock_embed_returns_cohere_shaped_response(mock_bedrock):
+    """A cohere.* modelId routes to a 1024-dim embedding payload."""
+    response = mock_bedrock.invoke_model(modelId="cohere.embed-multilingual-v3")
     payload = json.loads(response["body"].read())
     assert "embeddings" in payload
     assert len(payload["embeddings"]) == 1

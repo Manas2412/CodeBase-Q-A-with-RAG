@@ -35,9 +35,15 @@ from typing import Sequence
 import asyncpg
 from pgvector.asyncpg import register_vector
 
-from app.ingestion.embedder import embed_query
 from app.review.bedrock_client import BedrockClient
 from app.review.diff_parser import DiffHunk
+
+# NOTE: `embed_query` is imported lazily inside build_context() to break
+# a circular import. Chain: any importer of `app.review` triggers this
+# module's load, which used to do `from app.ingestion.embedder import
+# embed_query` — but embedder.py imports from `app.review.bedrock_client`,
+# which itself touches `app.review/__init__.py`. The lazy import keeps
+# the module-level graph acyclic; the runtime call still works the same.
 
 
 #: Default per-review context budget. ~10K input tokens is well within
@@ -163,6 +169,9 @@ async def build_context(
 
     semantic_chunks: list[ContextChunk] = []
     if added_text:
+        # Lazy import — see module-level comment for the circular-import rationale.
+        from app.ingestion.embedder import embed_query
+
         query_vec = await embed_query(added_text, client=client)
         semantic_rows = await conn.fetch(
             """

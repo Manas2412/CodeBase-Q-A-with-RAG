@@ -1,11 +1,40 @@
 # app/db/database.py
+import json
 import os
 from urllib.parse import urlparse
+
+import asyncpg
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+async def register_jsonb_codecs(conn: asyncpg.Connection) -> None:
+    """Register pg_catalog.jsonb + pg_catalog.json codecs on a single connection.
+
+    Without this, asyncpg returns JSONB columns as raw strings. We register
+    json.dumps / json.loads so list[str] / dict columns (branches_to_review,
+    last_reviewed_sha, severity_counts, token_usage, etc.) round-trip as
+    Python lists / dicts.
+
+    Used by:
+      • the FastAPI lifespan (init callback for the pool)
+      • the Celery worker tasks (each task creates its own conn)
+    """
+    await conn.set_type_codec(
+        "jsonb",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
+    await conn.set_type_codec(
+        "json",
+        encoder=json.dumps,
+        decoder=json.loads,
+        schema="pg_catalog",
+    )
 
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}

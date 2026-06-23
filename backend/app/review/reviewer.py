@@ -290,6 +290,7 @@ async def run_review_for_push(
     checklist_version: int = DEFAULT_CHECKLIST_VERSION,
     token_budget: int = 10_000,
     persist: bool = True,
+    review_id: uuid.UUID | None = None,
 ) -> ReviewResult:
     """End-to-end review for a (branch, before..after) push.
 
@@ -299,21 +300,50 @@ async def run_review_for_push(
     4. Parse findings
     5. Persist to `reviews` + `review_findings` (when persist=True)
 
-    Returns the full ReviewResult including review_id (when persisted).
-    For dry-runs (tests, ad-hoc local review), pass `persist=False` and
-    review_id will be None.
+    Persistence modes:
+      * `review_id` provided (Day-5 production path) — UPDATE the
+        pre-existing pending row claimed atomically by `_review_push`.
+      * `review_id` None (tests, ad-hoc reviews) — INSERT a fresh
+        'done' row. Same behaviour as Day 4.
 
-    Empty diffs short-circuit — we return an empty review without an LLM call.
+    For dry-runs pass `persist=False`; the returned `review_id` is then
+    whatever was passed in (or None).
+
+    Empty diffs short-circuit — we return an empty review without an LLM call,
+    and if `persist=True` with a pre-claimed `review_id`, we still mark it
+    'done' so the row doesn't linger as a stale 'running'.
     """
     hunks = await diff_between(project_id, before, after)
     if not hunks:
         # Nothing to review. Don't burn LLM tokens.
+        empty_summary = "No changes between the supplied SHAs."
+        empty_severity = _count_severities([])
+        empty_token_usage = {"input": 0, "output": 0, "total": 0}
+
+        # When a pre-claimed review_id is in play we still mark the row
+        # 'done' so it doesn't linger as 'running' forever (otherwise the
+        # partial unique index keeps blocking future writes for this tuple).
+        if persist and review_id is not None:
+            await _persist_review(
+                conn=conn,
+                project_id=project_id,
+                branch=branch,
+                before_sha=before,
+                after_sha=after,
+                summary=empty_summary,
+                severity_counts=empty_severity,
+                token_usage=empty_token_usage,
+                checklist_version=checklist_version,
+                findings=[],
+                review_id=review_id,
+            )
+
         return ReviewResult(
-            review_id=None,
-            summary="No changes between the supplied SHAs.",
+            review_id=review_id,
+            summary=empty_summary,
             findings=[],
-            severity_counts=_count_severities([]),
-            token_usage={"input": 0, "output": 0, "total": 0},
+            severity_counts=empty_severity,
+            token_usage=empty_token_usage,
             raw_response="",
         )
 
@@ -336,9 +366,11 @@ async def run_review_for_push(
         "cache_creation": response.cache_creation_tokens,
     }
 
-    review_id: uuid.UUID | None = None
+    persisted_review_id: uuid.UUID | None = review_id
     if persist:
-        review_id = await _persist_review(
+        # _persist_review handles both modes: UPDATE the pre-claimed row
+        # if review_id is set, otherwise INSERT a fresh 'done' row.
+        persisted_review_id = await _persist_review(
             conn=conn,
             project_id=project_id,
             branch=branch,
@@ -349,10 +381,11 @@ async def run_review_for_push(
             token_usage=token_usage,
             checklist_version=checklist_version,
             findings=findings,
+            review_id=review_id,
         )
 
     return ReviewResult(
-        review_id=review_id,
+        review_id=persisted_review_id,
         summary=summary,
         findings=findings,
         severity_counts=severity_counts,
@@ -374,31 +407,69 @@ async def _persist_review(
     token_usage: dict[str, int],
     checklist_version: int,
     findings: Sequence[Finding],
+    review_id: uuid.UUID | None = None,
 ) -> uuid.UUID:
-    """Insert one review row + its findings. Returns the new review_id."""
-    review_id = uuid.uuid4()
-    await conn.execute(
-        """
-        INSERT INTO reviews (
-            id, project_id, branch, before_sha, after_sha,
-            status, summary, severity_counts, token_usage,
-            checklist_version, batch_mode, completed_at
-        ) VALUES (
-            $1::uuid, $2::uuid, $3, $4, $5,
-            'done', $6, $7, $8,
-            $9, 'batch', now()
+    """Finalise a review row.
+
+    Two modes:
+      * `review_id` given (production path) — UPDATE the pre-existing
+        pending/running row to 'done' with the LLM outputs. This is what
+        the polling worker uses since Day 5: `_review_push` atomically
+        claims the row first, then this function fills it in.
+      * `review_id` None (ad-hoc, tests, dry-run) — INSERT a fresh row.
+        Kept for backward compatibility with any code path that doesn't
+        pre-claim.
+
+    Findings get inserted in a separate executemany either way.
+    """
+    if review_id is None:
+        # Legacy / standalone path — used by tests and any caller that
+        # doesn't pre-claim. INSERT a new 'done' row.
+        review_id = uuid.uuid4()
+        await conn.execute(
+            """
+            INSERT INTO reviews (
+                id, project_id, branch, before_sha, after_sha,
+                status, summary, severity_counts, token_usage,
+                checklist_version, batch_mode, completed_at
+            ) VALUES (
+                $1::uuid, $2::uuid, $3, $4, $5,
+                'done', $6, $7, $8,
+                $9, 'batch', now()
+            )
+            """,
+            review_id,
+            project_id,
+            branch,
+            before_sha,
+            after_sha,
+            summary,
+            severity_counts,
+            token_usage,
+            checklist_version,
         )
-        """,
-        review_id,
-        project_id,
-        branch,
-        before_sha,
-        after_sha,
-        summary,
-        severity_counts,
-        token_usage,
-        checklist_version,
-    )
+    else:
+        # Production path — fill in the pending row claimed earlier.
+        # We don't touch project_id/branch/before_sha/after_sha — they
+        # were set at claim time and re-asserting them risks masking a
+        # caller-side mismatch bug.
+        await conn.execute(
+            """
+            UPDATE reviews
+               SET status = 'done',
+                   summary = $2,
+                   severity_counts = $3,
+                   token_usage = $4,
+                   checklist_version = $5,
+                   completed_at = now()
+             WHERE id = $1::uuid
+            """,
+            review_id,
+            summary,
+            severity_counts,
+            token_usage,
+            checklist_version,
+        )
 
     if findings:
         records = [

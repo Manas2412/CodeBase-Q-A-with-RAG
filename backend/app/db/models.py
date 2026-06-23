@@ -189,6 +189,18 @@ class Commit(Base):
         String(16), default="poll", nullable=False
     )  # 'poll' | 'webhook' | 'manual'
 
+    # Day-5: which review covered this commit. Nullable because:
+    #   • ON DELETE SET NULL keeps the commit row when its review is deleted
+    #   • Day-3-era rows from before this migration stay NULL
+    # The /reviews/{id} detail endpoint joins on this column for hard
+    # attribution (replacing the Day-4 time-window approximation).
+    review_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("reviews.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     created_at: Mapped[datetime.datetime] = _created_at()
 
     project: Mapped[Project] = relationship(back_populates="commits")

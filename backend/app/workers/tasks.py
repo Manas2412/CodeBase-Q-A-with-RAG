@@ -430,7 +430,28 @@ async def _review_push(
     before_sha: str,
     after_sha: str,
 ) -> None:
+    """Run one review end-to-end.
+
+    Day-5 flow (atomic claim + FK attribution):
+      1. Idempotency: if a done review exists for this exact diff, skip
+         the LLM and just bump last_reviewed_sha.
+      2. Atomic claim: INSERT a `status='pending'` review row with
+         `ON CONFLICT DO NOTHING` against the partial unique index on
+         (project, branch, before, after) WHERE status IN ('pending',
+         'running'). If RETURNING is empty, another worker is already
+         on this diff — bail silently.
+      3. Mark the claim 'running' (purely cosmetic — the row is already
+         taken at this point).
+      4. Persist commits with the review_id FK so attribution survives.
+      5. Run the LLM (UPDATEs the claimed row to 'done').
+      6. Bump last_reviewed_sha LAST so Celery retry semantics work.
+
+    On any exception inside the try/except below, the claimed row is
+    marked 'error' so the partial unique index unblocks future retries
+    AND the error history is preserved for post-mortem.
+    """
     conn = await _open_conn()
+    review_id: uuid.UUID | None = None
     try:
         await register_vector(conn)
 
@@ -458,24 +479,67 @@ async def _review_push(
             )
             return
 
-        # 2. Persist commit attribution. Done BEFORE the LLM call so
-        #    even if Bedrock dies we still have the commit rows for the
-        #    next retry / manual investigation.
+        # 2. Atomic claim. The partial unique index
+        #    `ix_reviews_inflight_unique` ensures only one row in
+        #    {pending, running} can exist per (project, branch, before,
+        #    after). A racing worker's INSERT returns NULL — we bail
+        #    silently without burning Bedrock tokens.
+        new_id = uuid.uuid4()
+        review_id = await conn.fetchval(
+            """
+            INSERT INTO reviews (
+                id, project_id, branch, before_sha, after_sha,
+                status, severity_counts, token_usage,
+                checklist_version, batch_mode
+            ) VALUES (
+                $1::uuid, $2::uuid, $3, $4, $5,
+                'pending', $6, $6,
+                NULL, 'batch'
+            )
+            ON CONFLICT DO NOTHING
+            RETURNING id
+            """,
+            new_id,
+            project_id,
+            branch,
+            before_sha,
+            after_sha,
+            {},   # empty severity_counts + token_usage placeholder
+        )
+        if review_id is None:
+            print(
+                f"[review] {project_id} {branch}: claim lost to another "
+                f"worker ({before_sha[:8]}..{after_sha[:8]}), skipping"
+            )
+            return
+
+        # 3. Move to 'running' for visibility in the dashboard while we work.
+        await conn.execute(
+            "UPDATE reviews SET status = 'running' WHERE id = $1::uuid",
+            review_id,
+        )
+
+        # 4. Commits with FK attribution. Done BEFORE the LLM call so
+        #    the attribution survives a Bedrock outage.
         commits = await commits_between(project_id, before_sha, after_sha)
         if commits:
-            await _upsert_commits(conn, project_id, branch, commits)
+            await _upsert_commits(
+                conn, project_id, branch, commits, review_id=review_id
+            )
 
-        # 3. Run the review (handles its own persistence of reviews +
-        #    review_findings rows). Returns the structured result.
+        # 5. Run the review — UPDATEs the pending row in place
+        #    (no longer inserts a new row).
         result = await run_review_for_push(
             project_id=project_id,
             before=before_sha,
             after=after_sha,
             branch=branch,
             conn=conn,
+            review_id=review_id,
         )
 
-        # 4. Bump the polling baseline LAST, after everything succeeded.
+        # 6. Bump the polling baseline LAST. If anything above raised,
+        #    this UPDATE never runs and the next poll re-enqueues.
         await _bump_last_reviewed_sha(conn, project_id, branch, after_sha)
 
         print(
@@ -485,6 +549,26 @@ async def _review_push(
             f"severity={result.severity_counts} "
             f"tokens={result.token_usage}"
         )
+    except Exception:
+        # Mark our claim 'error' so the partial unique index unblocks
+        # AND we keep the failed attempt as audit history. Don't mask
+        # the original exception if the bookkeeping UPDATE itself fails.
+        if review_id is not None:
+            try:
+                await conn.execute(
+                    """
+                    UPDATE reviews
+                       SET status = 'error',
+                           completed_at = now()
+                     WHERE id = $1::uuid
+                    """,
+                    review_id,
+                )
+            except Exception as inner:
+                print(
+                    f"[review] failed to mark review {review_id} 'error': {inner!r}"
+                )
+        raise
     finally:
         await conn.close()
 
@@ -496,9 +580,15 @@ async def _upsert_commits(
     commits: list,
     *,
     source: str = "poll",
+    review_id: uuid.UUID | None = None,
 ) -> None:
-    """Bulk-insert commit rows. ON CONFLICT (project_id, sha) DO NOTHING
-    because the same commit can appear in multiple branches' histories.
+    """Bulk-insert commit rows tagged with the review they belong to.
+
+    `ON CONFLICT (project_id, sha) DO UPDATE` is used so the SAME commit
+    appearing in multiple branches (e.g. cherry-picked, or a branch
+    pointing back at main) gets its `review_id` re-attributed if a more
+    recent review covered it. The trade-off: the latest review wins,
+    which matches the dashboard's "most recent attribution" semantics.
     """
     if not commits:
         return
@@ -516,6 +606,7 @@ async def _upsert_commits(
             c.committed_at,
             c.subject,
             source,
+            review_id,
         )
         for c in commits
     ]
@@ -524,13 +615,15 @@ async def _upsert_commits(
         INSERT INTO commits (
             id, project_id, branch, sha, parent_sha,
             author_name, author_email, committer_name, committer_email,
-            committed_at, subject, source
+            committed_at, subject, source, review_id
         ) VALUES (
             $1::uuid, $2::uuid, $3, $4, $5,
             $6, $7, $8, $9,
-            $10, $11, $12
+            $10, $11, $12, $13
         )
-        ON CONFLICT (project_id, sha) DO NOTHING
+        ON CONFLICT (project_id, sha) DO UPDATE
+           SET review_id = EXCLUDED.review_id
+         WHERE EXCLUDED.review_id IS NOT NULL
         """,
         records,
     )

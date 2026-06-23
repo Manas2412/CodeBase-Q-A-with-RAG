@@ -231,6 +231,41 @@ class CommitListResponse(BaseModel):
     offset: int
 
 
+# ── BranchEvent models ──────────────────────────────────────────────────
+class BranchEventOut(BaseModel):
+    """A notable event on a watched branch — force-push, new branch, etc."""
+
+    id: str
+    project_id: str
+    branch: str
+    event_type: str   # 'force_push' | 'new_branch' | 'branch_deleted'
+    detail: dict      # event-type-specific payload (e.g. {previous_sha, new_sha})
+    resolved: bool
+    created_at: str
+
+
+class BranchEventListResponse(BaseModel):
+    events: list[BranchEventOut]
+    total: int
+    limit: int
+    offset: int
+    #: Number of unresolved events across ALL filters — handy for the
+    #: dashboard's red-dot indicator regardless of which filter is active.
+    unresolved_total: int
+
+
+def _row_to_branch_event(row: asyncpg.Record) -> BranchEventOut:
+    return BranchEventOut(
+        id=str(row["id"]),
+        project_id=str(row["project_id"]),
+        branch=row["branch"],
+        event_type=row["event_type"],
+        detail=row["detail"] or {},
+        resolved=row["resolved"],
+        created_at=row["created_at"].isoformat(),
+    )
+
+
 #: Severity ordering used everywhere a severity sort matters — critical first.
 #: Postgres CASE expressions reference this list by index; keep in sync if you
 #: add a level.
@@ -787,10 +822,10 @@ async def list_project_reviews(
 async def get_review(review_id: str):
     """Single review with full `summary` blob + commit attribution.
 
-    `commits[]` is the list of commits on the same branch that landed at or
-    before this review's created_at, going back to either the previous
-    review or 30 days, whichever is closer. This is a soft approximation
-    until Day 5 introduces a `commits.review_id` FK for hard attribution.
+    `commits[]` is the list of commits attributed to this review via the
+    `commits.review_id` FK (Day 5). Old reviews from before that migration
+    have NULL review_id on their commits and will return an empty list —
+    that's correct behaviour, those reviews predate hard attribution.
     """
     rid = _parse_uuid(review_id, field="review_id")
 
@@ -806,59 +841,20 @@ async def get_review(review_id: str):
         if not review_row:
             raise HTTPException(status_code=404, detail="Review not found")
 
-        # Find the previous review on the same branch — this review's commits
-        # are the ones committed AFTER that boundary. If there's no previous
-        # review (this is the first), fall back to a 30-day window.
-        prev_review_created = await conn.fetchval(
+        # Hard attribution via the FK — no more time-window guessing.
+        # Commits ordered newest-first so the dashboard's "what changed"
+        # panel mirrors `git log`.
+        commit_rows = await conn.fetch(
             """
-            SELECT created_at FROM reviews
-             WHERE project_id = $1
-               AND branch     = $2
-               AND created_at < $3
-             ORDER BY created_at DESC
-             LIMIT 1
+            SELECT sha, parent_sha, branch, author_name, author_email,
+                   committer_name, committer_email, committed_at,
+                   subject, source
+              FROM commits
+             WHERE review_id = $1
+             ORDER BY committed_at DESC
             """,
-            review_row["project_id"],
-            review_row["branch"],
-            review_row["created_at"],
+            rid,
         )
-        # `interval '30 days'` is a soft cap — keeps the first-review case
-        # from returning the project's entire git history.
-        if prev_review_created is None:
-            commit_rows = await conn.fetch(
-                """
-                SELECT sha, parent_sha, branch, author_name, author_email,
-                       committer_name, committer_email, committed_at,
-                       subject, source
-                  FROM commits
-                 WHERE project_id = $1
-                   AND branch     = $2
-                   AND committed_at <= $3
-                   AND committed_at >  ($3::timestamptz - interval '30 days')
-                 ORDER BY committed_at DESC
-                """,
-                review_row["project_id"],
-                review_row["branch"],
-                review_row["created_at"],
-            )
-        else:
-            commit_rows = await conn.fetch(
-                """
-                SELECT sha, parent_sha, branch, author_name, author_email,
-                       committer_name, committer_email, committed_at,
-                       subject, source
-                  FROM commits
-                 WHERE project_id = $1
-                   AND branch     = $2
-                   AND committed_at >  $3
-                   AND committed_at <= $4
-                 ORDER BY committed_at DESC
-                """,
-                review_row["project_id"],
-                review_row["branch"],
-                prev_review_created,
-                review_row["created_at"],
-            )
 
     summary = _row_to_review_summary(review_row)
     return ReviewDetail(
@@ -1008,6 +1004,131 @@ async def list_project_commits(
         limit=limit,
         offset=offset,
     )
+
+
+# ── Branch event endpoints ──────────────────────────────────────────────
+#
+# Two endpoints power the dashboard's "needs attention" banner:
+#   GET  /projects/{id}/branch-events  — list, filter by resolved + branch
+#   POST /branch-events/{id}/resolve   — operator dismisses one
+#
+# Force-pushes are recorded by the polling agent (Week 3 Day 2). New-branch
+# and branch-deleted events are recorded in Day 5 once we wire the helper
+# into the discovery path. The shape is event-type-agnostic — adding a new
+# event_type is a worker-side change only, no schema migration.
+
+@app.get(
+    "/projects/{project_id}/branch-events",
+    response_model=BranchEventListResponse,
+)
+async def list_project_branch_events(
+    project_id: str,
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    resolved: bool | None = Query(
+        None,
+        description="Filter by resolved status. Omit to return both.",
+    ),
+    branch: str | None = Query(None, description="Filter by branch name"),
+    event_type: str | None = Query(
+        None,
+        description="Filter by event type (force_push, new_branch, branch_deleted)",
+    ),
+):
+    """List branch events for a project, newest first.
+
+    Returns `unresolved_total` alongside the page so the dashboard can
+    show a red-dot count even when the user filters to `resolved=true`.
+    """
+    pid = _parse_uuid(project_id, field="project_id")
+
+    where_parts = ["e.project_id = $1"]
+    params: list = [pid]
+    if resolved is not None:
+        params.append(resolved)
+        where_parts.append(f"e.resolved = ${len(params)}")
+    if branch:
+        params.append(branch)
+        where_parts.append(f"e.branch = ${len(params)}")
+    if event_type:
+        params.append(event_type)
+        where_parts.append(f"e.event_type = ${len(params)}")
+    where_sql = "WHERE " + " AND ".join(where_parts)
+
+    list_params = [*params, limit, offset]
+    limit_p = f"${len(list_params) - 1}"
+    offset_p = f"${len(list_params)}"
+
+    async with db_pool.acquire() as conn:
+        exists = await conn.fetchval(
+            "SELECT 1 FROM projects WHERE id = $1", pid
+        )
+        if not exists:
+            raise HTTPException(status_code=404, detail="Project not found")
+
+        rows = await conn.fetch(
+            f"""
+            SELECT e.id, e.project_id, e.branch, e.event_type, e.detail,
+                   e.resolved, e.created_at
+              FROM branch_events e
+              {where_sql}
+             ORDER BY e.created_at DESC
+             LIMIT {limit_p} OFFSET {offset_p}
+            """,
+            *list_params,
+        )
+        total = await conn.fetchval(
+            f"SELECT COUNT(*) FROM branch_events e {where_sql}", *params
+        )
+        # Unresolved count is independent of the user's filters — the
+        # dashboard always shows the same red-dot number regardless of view.
+        unresolved_total = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM branch_events
+             WHERE project_id = $1 AND resolved = false
+            """,
+            pid,
+        )
+
+    return BranchEventListResponse(
+        events=[_row_to_branch_event(r) for r in rows],
+        total=total or 0,
+        limit=limit,
+        offset=offset,
+        unresolved_total=unresolved_total or 0,
+    )
+
+
+@app.post(
+    "/branch-events/{event_id}/resolve",
+    response_model=BranchEventOut,
+)
+async def resolve_branch_event(event_id: str):
+    """Mark a branch event as resolved (operator dismissal).
+
+    Returns the updated row. 404 on unknown id. Re-resolving an already-
+    resolved event is a no-op — idempotent by design so a double-click on
+    the dashboard button doesn't 500.
+    """
+    eid = _parse_uuid(event_id, field="event_id")
+
+    async with db_pool.acquire() as conn:
+        # RETURNING * via a single UPDATE keeps the round-trip count down
+        # and avoids a TOCTOU between "exists?" and "update".
+        row = await conn.fetchrow(
+            """
+            UPDATE branch_events
+               SET resolved = true
+             WHERE id = $1
+            RETURNING id, project_id, branch, event_type, detail,
+                      resolved, created_at
+            """,
+            eid,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Branch event not found")
+
+    return _row_to_branch_event(row)
 
 
 @app.get("/repos/{repo_id}/status")

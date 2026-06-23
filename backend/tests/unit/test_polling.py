@@ -11,6 +11,7 @@ Strategy:
 
 from __future__ import annotations
 
+import uuid
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -401,12 +402,29 @@ async def test_check_continues_when_one_branch_is_deleted(monkeypatch):
     assert delay_mock.call_args.args == ("p-1", "main", "abc111", "def333")
 
 
-# ── _review_push (Week 3 Day 3) ─────────────────────────────────────────
+# ── _review_push (Week 3 Day 3, Day 5-refactored) ───────────────────────
 class _ReviewConn:
-    """FakeConn supporting fetchval + execute + executemany + close."""
+    """FakeConn for _review_push tests.
 
-    def __init__(self, existing_review_id=None):
-        self.existing_review_id = existing_review_id
+    Day 5 makes _review_push call fetchval TWICE in the normal path
+    (idempotency-check, then atomic-claim-INSERT-RETURNING). The default
+    setup queues `[done_id_or_None, claim_id_or_None]` in that order.
+
+    Tests that don't care about claim_id can leave it at its default
+    (a fresh UUID — happy path "we successfully claimed the row").
+    """
+
+    def __init__(
+        self,
+        *,
+        existing_done_id=None,
+        claim_id: object = "DEFAULT",
+    ):
+        # First fetchval = idempotency check ('done' row exists?)
+        # Second fetchval = atomic claim INSERT RETURNING
+        if claim_id == "DEFAULT":
+            claim_id = uuid.UUID("99999999-9999-9999-9999-999999999999")
+        self._fetchval_queue: list = [existing_done_id, claim_id]
         self.fetchval_calls: list[tuple[str, tuple]] = []
         self.executes: list[tuple[str, tuple]] = []
         self.executemany_calls: list[tuple[str, list]] = []
@@ -414,7 +432,11 @@ class _ReviewConn:
 
     async def fetchval(self, query: str, *args):
         self.fetchval_calls.append((query, args))
-        return self.existing_review_id
+        if not self._fetchval_queue:
+            # Default to None for any extra fetchval — keeps tests forgiving
+            # if the production code adds another query down the line.
+            return None
+        return self._fetchval_queue.pop(0)
 
     async def execute(self, query: str, *args):
         self.executes.append((query, args))
@@ -484,11 +506,19 @@ class _FakeReviewResult:
 
 
 @pytest.mark.asyncio
-async def test_review_push_persists_commits_then_review_then_bumps_sha(monkeypatch):
-    """Happy path: commits inserted, review run, last_reviewed_sha bumped."""
+async def test_review_push_claims_then_persists_then_bumps_sha(monkeypatch):
+    """Happy path (Day-5):
+      1. Idempotency check → no existing done review
+      2. Atomic claim INSERT → returns a claim_id
+      3. UPDATE status='running'
+      4. Commits inserted with the claim_id as review_id (FK)
+      5. run_review_for_push called with review_id=claim_id (UPDATEs the row)
+      6. last_reviewed_sha bumped
+    """
     import app.workers.tasks as t
 
-    conn = _ReviewConn(existing_review_id=None)
+    claim_id = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+    conn = _ReviewConn(existing_done_id=None, claim_id=claim_id)
     monkeypatch.setattr(t, "_open_conn", AsyncMock(return_value=conn))
     _patch_review_helpers(
         monkeypatch,
@@ -497,19 +527,28 @@ async def test_review_push_persists_commits_then_review_then_bumps_sha(monkeypat
 
     await t._review_push("p-1", "main", "before-sha", "after-sha")
 
-    # commits inserted via executemany
+    # commits inserted via executemany — last record element is review_id (the FK)
     assert len(conn.executemany_calls) == 1
     insert_query, records = conn.executemany_calls[0]
     assert "INSERT INTO commits" in insert_query
+    assert "review_id" in insert_query  # FK column is in the INSERT
     assert len(records) == 2
-    # Each record carries (id, project_id, branch, sha, parent, ...)
-    assert records[0][2] == "main"  # branch
-    assert records[0][3] == "c1"    # sha
+    # Each record: (id, project_id, branch, sha, parent, ..., source, review_id)
+    assert records[0][2] == "main"     # branch
+    assert records[0][3] == "c1"       # sha
+    assert records[0][-1] == claim_id  # FK pointing at the claimed review
 
-    # last_reviewed_sha bumped (last UPDATE)
-    update_calls = [e for e in conn.executes if "UPDATE projects" in e[0]]
-    assert len(update_calls) == 1
-    sha_arg, project_id_arg = update_calls[-1][1]
+    # UPDATE reviews SET status='running' should have happened
+    running_updates = [
+        e for e in conn.executes
+        if "UPDATE reviews" in e[0] and "'running'" in e[0]
+    ]
+    assert len(running_updates) == 1
+
+    # last_reviewed_sha bumped (UPDATE projects)
+    project_updates = [e for e in conn.executes if "UPDATE projects" in e[0]]
+    assert len(project_updates) == 1
+    sha_arg, project_id_arg = project_updates[-1][1]
     assert sha_arg == {"main": "after-sha"}
     assert project_id_arg == "p-1"
 
@@ -521,8 +560,9 @@ async def test_review_push_idempotent_when_done_review_exists(monkeypatch):
     """Retry of a partially-succeeded task: existing done review → skip LLM."""
     import app.workers.tasks as t
 
-    existing_id = "11111111-1111-1111-1111-111111111111"
-    conn = _ReviewConn(existing_review_id=existing_id)
+    existing_id = uuid.UUID("11111111-1111-1111-1111-111111111111")
+    # First fetchval returns the existing done id → idempotent path
+    conn = _ReviewConn(existing_done_id=existing_id, claim_id=None)
     monkeypatch.setattr(t, "_open_conn", AsyncMock(return_value=conn))
 
     # The idempotent path should NEVER hit run_review_for_push or commits_between
@@ -539,19 +579,20 @@ async def test_review_push_idempotent_when_done_review_exists(monkeypatch):
 
     await t._review_push("p-1", "main", "before-sha", "after-sha")
 
-    # Only the SHA bump UPDATE happened (no commit inserts)
+    # No commit inserts, no atomic claim attempted (second fetchval shouldn't fire)
     assert conn.executemany_calls == []
-    update_calls = [e for e in conn.executes if "UPDATE projects" in e[0]]
-    assert len(update_calls) == 1
+    # Only the SHA bump UPDATE happened
+    project_updates = [e for e in conn.executes if "UPDATE projects" in e[0]]
+    assert len(project_updates) == 1
 
 
 @pytest.mark.asyncio
 async def test_review_push_no_commits_doesnt_executemany(monkeypatch):
-    """Empty commits range (e.g., between SHAs identical to a tag move):
-    skip the executemany but still run the review."""
+    """Empty commits range — claim still happens, review still runs, but
+    no executemany on commits because there are no commit rows to write."""
     import app.workers.tasks as t
 
-    conn = _ReviewConn(existing_review_id=None)
+    conn = _ReviewConn(existing_done_id=None)
     monkeypatch.setattr(t, "_open_conn", AsyncMock(return_value=conn))
     _patch_review_helpers(monkeypatch, commits=[])
 
@@ -560,17 +601,21 @@ async def test_review_push_no_commits_doesnt_executemany(monkeypatch):
     # No commit INSERT (commits=[])
     assert conn.executemany_calls == []
     # SHA still bumped
-    update_calls = [e for e in conn.executes if "UPDATE projects" in e[0]]
-    assert len(update_calls) == 1
+    project_updates = [e for e in conn.executes if "UPDATE projects" in e[0]]
+    assert len(project_updates) == 1
 
 
 @pytest.mark.asyncio
-async def test_review_push_does_not_bump_sha_if_review_raises(monkeypatch):
-    """If run_review_for_push raises, last_reviewed_sha must NOT update —
-    Celery retry needs to re-enqueue the same review."""
+async def test_review_push_marks_error_when_review_raises(monkeypatch):
+    """If run_review_for_push raises:
+      • last_reviewed_sha must NOT update (Celery retry needs to re-fire)
+      • The claimed review row must be UPDATEd to status='error' so the
+        partial unique index unblocks the retry's fresh claim.
+    """
     import app.workers.tasks as t
 
-    conn = _ReviewConn(existing_review_id=None)
+    claim_id = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+    conn = _ReviewConn(existing_done_id=None, claim_id=claim_id)
     monkeypatch.setattr(t, "_open_conn", AsyncMock(return_value=conn))
 
     async def _exploding_review(**_kw):
@@ -589,7 +634,53 @@ async def test_review_push_does_not_bump_sha_if_review_raises(monkeypatch):
     with pytest.raises(RuntimeError, match="bedrock down"):
         await t._review_push("p-1", "main", "before-sha", "after-sha")
 
-    # No SHA bump
-    update_calls = [e for e in conn.executes if "UPDATE projects" in e[0]]
-    assert update_calls == []
+    # No project SHA bump
+    project_updates = [e for e in conn.executes if "UPDATE projects" in e[0]]
+    assert project_updates == []
+
+    # The claimed review row WAS marked as 'error' in the except block
+    error_updates = [
+        e for e in conn.executes
+        if "UPDATE reviews" in e[0] and "'error'" in e[0]
+    ]
+    assert len(error_updates) == 1
+    assert error_updates[0][1] == (claim_id,)
+
     assert conn.closed  # connection still closed on the way out
+
+
+@pytest.mark.asyncio
+async def test_review_push_bails_silently_when_claim_lost_to_concurrent_worker(monkeypatch):
+    """ON CONFLICT DO NOTHING returns NULL when the partial unique index
+    blocks the INSERT. That means a concurrent worker is already on this
+    diff — bail silently without burning Bedrock tokens."""
+    import app.workers.tasks as t
+
+    # Idempotency: no done review. Claim: NULL (another worker has it).
+    conn = _ReviewConn(existing_done_id=None, claim_id=None)
+    monkeypatch.setattr(t, "_open_conn", AsyncMock(return_value=conn))
+
+    async def _shouldnt_be_called(*_a, **_kw):
+        raise AssertionError("Lost-claim path must not call commits/LLM helpers")
+
+    monkeypatch.setattr(t, "commits_between", _shouldnt_be_called)
+    monkeypatch.setattr(t, "run_review_for_push", _shouldnt_be_called)
+
+    async def _noop(_):
+        return None
+
+    monkeypatch.setattr(t, "register_vector", _noop)
+
+    # Must NOT raise — silent bail is the contract
+    await t._review_push("p-1", "main", "before-sha", "after-sha")
+
+    # No commit inserts, no sha bump
+    assert conn.executemany_calls == []
+    project_updates = [e for e in conn.executes if "UPDATE projects" in e[0]]
+    assert project_updates == []
+    # No running-status update either (we never claimed it)
+    running_updates = [
+        e for e in conn.executes
+        if "UPDATE reviews" in e[0] and "'running'" in e[0]
+    ]
+    assert running_updates == []

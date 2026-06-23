@@ -287,11 +287,12 @@ class TestListProjectReviews:
 
 # ── GET /reviews/{id} ─────────────────────────────────────────────────────
 class TestGetReview:
+    """Day-5: commits queried via the FK, not a time-window."""
+
     def test_returns_review_with_summary_and_commits(
         self, client: TestClient, fake_conn: FakeConn
     ) -> None:
         fake_conn.queue_fetchrow(_review_row(summary="Looks fine.", finding_count=1))
-        fake_conn.queue_fetchval(None)  # no previous review (first ever)
         fake_conn.queue_fetch([_commit_row("c1"), _commit_row("c2")])
 
         r = client.get(f"/reviews/{_review_id()}")
@@ -304,28 +305,45 @@ class TestGetReview:
         assert len(body["commits"]) == 2
         assert body["commits"][0]["sha"] == "c1"
 
-    def test_uses_previous_review_window_when_one_exists(
+    def test_commit_query_uses_review_id_fk(
         self, client: TestClient, fake_conn: FakeConn
     ) -> None:
-        """When a previous review exists, commits are scoped to (prev, this]."""
+        """The commit query must filter by review_id directly — no time-window
+        guessing, no LAG over prior reviews. One query, hard attribution.
+
+        We assert on the WHERE clause specifically (committed_at appears
+        in the SELECT and ORDER BY columns — that's expected).
+        """
         fake_conn.queue_fetchrow(_review_row())
-        prev_time = datetime.datetime(2026, 6, 22, 12, 0, tzinfo=datetime.timezone.utc)
-        fake_conn.queue_fetchval(prev_time)  # previous review exists
         fake_conn.queue_fetch([_commit_row()])
 
         r = client.get(f"/reviews/{_review_id()}")
 
         assert r.status_code == 200
-        # The 3rd query (commit fetch) should be the "previous review window"
-        # path — params include both boundaries.
         commit_fetches = [
-            q for kind, q, args in fake_conn.queries
+            q for kind, q, _ in fake_conn.queries
             if kind == "fetch" and "FROM commits" in q
         ]
         assert len(commit_fetches) == 1
-        # Bounded by `>` and `<=`
-        assert "committed_at >  $3" in commit_fetches[0]
-        assert "committed_at <= $4" in commit_fetches[0]
+        # Hard attribution: WHERE review_id = $1, no time bounds.
+        where_clause = commit_fetches[0].split("WHERE", 1)[1].split("ORDER BY")[0]
+        assert "review_id = $1" in where_clause
+        # And the old time-window approach should be GONE
+        assert "committed_at <=" not in where_clause
+        assert "committed_at >" not in where_clause
+
+    def test_commits_empty_for_pre_day5_reviews(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        """Reviews from before the FK migration have NULL review_id on
+        their commits → the join returns empty. That's correct semantics."""
+        fake_conn.queue_fetchrow(_review_row(summary="old review"))
+        fake_conn.queue_fetch([])
+
+        r = client.get(f"/reviews/{_review_id()}")
+
+        assert r.status_code == 200
+        assert r.json()["commits"] == []
 
     def test_404_on_unknown_review(self, client: TestClient, fake_conn: FakeConn) -> None:
         fake_conn.queue_fetchrow(None)
@@ -458,3 +476,165 @@ class TestListProjectCommits:
         r = client.get(f"/projects/{_project_id()}/commits")
         assert r.status_code == 404
         assert r.json()["detail"] == "Project not found"
+
+
+# ── BranchEvent fixtures + endpoint tests (Day 5B) ────────────────────────
+def _branch_event_row(
+    *,
+    event_id: uuid.UUID | None = None,
+    project_id: uuid.UUID | None = None,
+    branch: str = "main",
+    event_type: str = "force_push",
+    detail: dict | None = None,
+    resolved: bool = False,
+    created_at: datetime.datetime | None = None,
+) -> FakeRecord:
+    return FakeRecord(
+        id=event_id or uuid.uuid4(),
+        project_id=project_id or _project_id(),
+        branch=branch,
+        event_type=event_type,
+        detail=detail or {"previous_sha": "aaa111", "new_sha": "bbb222"},
+        resolved=resolved,
+        created_at=created_at
+        or datetime.datetime(2026, 6, 23, 9, 0, tzinfo=datetime.timezone.utc),
+    )
+
+
+class TestListBranchEvents:
+    def test_returns_events_and_unresolved_total(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        fake_conn.queue_fetchval(1)  # project exists
+        fake_conn.queue_fetch([
+            _branch_event_row(branch="dev", resolved=False),
+            _branch_event_row(branch="main", resolved=True),
+        ])
+        fake_conn.queue_fetchval(2)  # filtered total
+        fake_conn.queue_fetchval(3)  # unresolved_total (project-wide, not filtered)
+
+        r = client.get(f"/projects/{_project_id()}/branch-events")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] == 2
+        assert body["unresolved_total"] == 3
+        assert len(body["events"]) == 2
+        first = body["events"][0]
+        assert first["event_type"] == "force_push"
+        assert first["detail"]["new_sha"] == "bbb222"
+
+    def test_resolved_filter_passes_through(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        fake_conn.queue_fetchval(1)
+        fake_conn.queue_fetch([])
+        fake_conn.queue_fetchval(0)
+        fake_conn.queue_fetchval(0)
+
+        r = client.get(
+            f"/projects/{_project_id()}/branch-events?resolved=false"
+        )
+
+        assert r.status_code == 200
+        main = next(
+            q for kind, q, _ in fake_conn.queries
+            if kind == "fetch" and "FROM branch_events" in q
+        )
+        assert "e.resolved = $2" in main
+
+    def test_combined_branch_and_event_type_filters(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        fake_conn.queue_fetchval(1)
+        fake_conn.queue_fetch([])
+        fake_conn.queue_fetchval(0)
+        fake_conn.queue_fetchval(0)
+
+        r = client.get(
+            f"/projects/{_project_id()}/branch-events"
+            "?branch=dev&event_type=force_push"
+        )
+
+        assert r.status_code == 200
+        main = next(
+            q for kind, q, _ in fake_conn.queries
+            if kind == "fetch" and "FROM branch_events" in q
+        )
+        assert "e.branch = $2" in main
+        assert "e.event_type = $3" in main
+
+    def test_unresolved_total_is_unfiltered_by_user_choice(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        """Even when the user is viewing `resolved=true`, unresolved_total
+        reflects the project-wide unresolved count — the dashboard's red-dot
+        number must not vary by view."""
+        fake_conn.queue_fetchval(1)
+        fake_conn.queue_fetch([_branch_event_row(resolved=True)])
+        fake_conn.queue_fetchval(1)   # filtered total
+        fake_conn.queue_fetchval(7)   # unresolved_total
+
+        r = client.get(
+            f"/projects/{_project_id()}/branch-events?resolved=true"
+        )
+
+        body = r.json()
+        assert body["total"] == 1
+        assert body["unresolved_total"] == 7
+
+    def test_404_on_unknown_project(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        fake_conn.queue_fetchval(None)
+        r = client.get(f"/projects/{_project_id()}/branch-events")
+        assert r.status_code == 404
+        assert r.json()["detail"] == "Project not found"
+
+
+class TestResolveBranchEvent:
+    def test_marks_event_resolved_and_returns_row(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        event_id = uuid.uuid4()
+        fake_conn.queue_fetchrow(_branch_event_row(event_id=event_id, resolved=True))
+
+        r = client.post(f"/branch-events/{event_id}/resolve")
+
+        assert r.status_code == 200
+        body = r.json()
+        assert body["id"] == str(event_id)
+        assert body["resolved"] is True
+        # The query should be a single UPDATE … RETURNING (no SELECT first)
+        update_calls = [
+            q for kind, q, _ in fake_conn.queries
+            if kind == "fetchrow" and "UPDATE branch_events" in q
+        ]
+        assert len(update_calls) == 1
+        assert "RETURNING" in update_calls[0]
+
+    def test_idempotent_when_already_resolved(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        """Calling resolve on an already-resolved event must return 200
+        with `resolved=true`, not 4xx — the UI may double-click."""
+        event_id = uuid.uuid4()
+        fake_conn.queue_fetchrow(_branch_event_row(event_id=event_id, resolved=True))
+
+        r = client.post(f"/branch-events/{event_id}/resolve")
+
+        assert r.status_code == 200
+        assert r.json()["resolved"] is True
+
+    def test_404_on_unknown_event(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        fake_conn.queue_fetchrow(None)  # UPDATE ... RETURNING returned no rows
+        r = client.post(f"/branch-events/{uuid.uuid4()}/resolve")
+        assert r.status_code == 404
+        assert r.json()["detail"] == "Branch event not found"
+
+    def test_400_on_bad_uuid(self, client: TestClient) -> None:
+        r = client.post("/branch-events/not-a-uuid/resolve")
+        assert r.status_code == 400
+        assert r.json()["detail"] == "event_id must be a UUID"

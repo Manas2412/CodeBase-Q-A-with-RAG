@@ -215,6 +215,12 @@ class FindingOut(BaseModel):
     message: str
     suggestion: str | None
     rule_id: str | None
+    #: Day-5: server-extracted code around the cited line. Null when the LLM
+    #: cited a line outside the diff (rare).
+    code_snippet: str | None
+    #: Day-5: LLM-emitted code-as-fix. Null for findings that don't carry a
+    #: literal code change (e.g. "no tests", "missing docstring").
+    suggested_code: str | None
 
 
 class FindingListResponse(BaseModel):
@@ -320,6 +326,8 @@ def _row_to_finding(row: asyncpg.Record) -> FindingOut:
         message=row["message"],
         suggestion=row["suggestion"],
         rule_id=row["rule_id"],
+        code_snippet=row["code_snippet"],
+        suggested_code=row["suggested_code"],
     )
 
 
@@ -915,7 +923,8 @@ async def list_review_findings(
             f"""
             SELECT f.id, f.review_id, f.commit_id, f.severity, f.category,
                    f.file_path, f.start_line, f.end_line, f.message,
-                   f.suggestion, f.rule_id
+                   f.suggestion, f.rule_id,
+                   f.code_snippet, f.suggested_code
               FROM review_findings f
               {where_sql}
              ORDER BY CASE f.severity
@@ -1129,6 +1138,153 @@ async def resolve_branch_event(event_id: str):
             raise HTTPException(status_code=404, detail="Branch event not found")
 
     return _row_to_branch_event(row)
+
+
+# ── PDF export (Week 4 Day 4) ───────────────────────────────────────────
+#
+# GET /reviews/{id}/pdf renders a printable review — the same data the
+# ReviewDetail page shows, packaged as a single-file PDF the reviewer can
+# email, archive, or attach to a compliance record.
+#
+# Rendering happens in-process via reportlab. That's fine for Phase 1 —
+# a typical review generates ~50KB of PDF in <200ms. If reports get large
+# enough to matter, we push the render into a Celery task and return a
+# signed URL to the pre-rendered blob (post-Phase-1).
+
+@app.get("/reviews/{review_id}/pdf")
+async def get_review_pdf(review_id: str):
+    """Serve the review as a PDF attachment.
+
+    Returns a ContentDisposition attachment with a filename that includes
+    the project name + short SHA so multi-review archives don't collide.
+    """
+    from fastapi.responses import Response
+    from app.reports import render_review_pdf
+
+    rid = _parse_uuid(review_id, field="review_id")
+
+    async with db_pool.acquire() as conn:
+        # Same fields as GET /reviews/{id} — kept as separate SQL so we can
+        # skip the read-endpoint's Pydantic round-trip.
+        review_row = await conn.fetchrow(
+            f"""
+            SELECT {_REVIEW_SUMMARY_COLUMNS}, r.summary
+              FROM reviews r
+             WHERE r.id = $1
+            """,
+            rid,
+        )
+        if not review_row:
+            raise HTTPException(status_code=404, detail="Review not found")
+
+        project_row = await conn.fetchrow(
+            "SELECT name, provider, repo_url FROM projects WHERE id = $1",
+            review_row["project_id"],
+        )
+        commits = await conn.fetch(
+            """
+            SELECT sha, parent_sha, branch, author_name, author_email,
+                   committer_name, committer_email, committed_at,
+                   subject, source
+              FROM commits
+             WHERE review_id = $1
+             ORDER BY committed_at DESC
+            """,
+            rid,
+        )
+        findings = await conn.fetch(
+            """
+            SELECT f.id, f.review_id, f.commit_id, f.severity, f.category,
+                   f.file_path, f.start_line, f.end_line, f.message,
+                   f.suggestion, f.rule_id,
+                   f.code_snippet, f.suggested_code
+              FROM review_findings f
+             WHERE f.review_id = $1
+             ORDER BY CASE f.severity
+                        WHEN 'critical' THEN 0
+                        WHEN 'major'    THEN 1
+                        WHEN 'minor'    THEN 2
+                        WHEN 'info'     THEN 3
+                        ELSE 4
+                      END,
+                      f.file_path,
+                      f.start_line NULLS LAST
+            """,
+            rid,
+        )
+
+    # Build the shape render_review_pdf expects — mostly a straight dict
+    # coercion. Timestamps get isoformatted so the renderer's parser side
+    # (datetime.fromisoformat) handles them uniformly.
+    review_dict = {
+        "branch": review_row["branch"],
+        "before_sha": review_row["before_sha"],
+        "after_sha": review_row["after_sha"],
+        "status": review_row["status"],
+        "severity_counts": review_row["severity_counts"] or {},
+        "token_usage": review_row["token_usage"] or {},
+        "summary": review_row["summary"],
+        "created_at": review_row["created_at"].isoformat(),
+        "completed_at": (
+            review_row["completed_at"].isoformat()
+            if review_row["completed_at"] else None
+        ),
+    }
+    project_dict = {
+        "name": project_row["name"] if project_row else "unknown-project",
+        "provider": project_row["provider"] if project_row else None,
+        "repo_url": project_row["repo_url"] if project_row else None,
+    }
+    commit_dicts = [
+        {
+            "sha": c["sha"],
+            "author_name": c["author_name"],
+            "author_email": c["author_email"],
+            "committed_at": c["committed_at"].isoformat(),
+            "subject": c["subject"],
+            "source": c["source"],
+        }
+        for c in commits
+    ]
+    finding_dicts = [
+        {
+            "severity": f["severity"],
+            "category": f["category"],
+            "file_path": f["file_path"],
+            "start_line": f["start_line"],
+            "end_line": f["end_line"],
+            "message": f["message"],
+            "suggestion": f["suggestion"],
+            "suggested_code": f["suggested_code"],
+            "code_snippet": f["code_snippet"],
+            "rule_id": f["rule_id"],
+        }
+        for f in findings
+    ]
+
+    pdf_bytes = render_review_pdf(
+        review=review_dict,
+        project=project_dict,
+        commits=commit_dicts,
+        findings=finding_dicts,
+    )
+
+    # Filename shape: "code-review_<project>_<short-sha>.pdf" — keeps a
+    # download dir sortable AND immediately identifies which review it is.
+    safe_name = "".join(
+        c if c.isalnum() or c in "-_." else "-" for c in project_dict["name"]
+    )[:60] or "review"
+    short_after = review_dict["after_sha"][:8] if review_dict["after_sha"] else "review"
+    filename = f"code-review_{safe_name}_{short_after}.pdf"
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "private, max-age=60",
+        },
+    )
 
 
 @app.get("/repos/{repo_id}/status")

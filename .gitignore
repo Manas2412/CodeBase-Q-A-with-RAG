@@ -19,8 +19,9 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# NOTE: don't add bare `lib/` or `lib64/` here — those come from Python's
+# stock venv .gitignore template and they'd also catch frontend/src/lib/.
+# The virtualenv itself is already covered by `.venv/`.
 parts/
 sdist/
 var/

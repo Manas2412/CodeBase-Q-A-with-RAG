@@ -37,6 +37,11 @@ dependencies = [
     # Used for both LLM (Claude Opus 4.6) and embeddings (Cohere Embed v3).
     "boto3>=1.34",
 
+    # PDF report generation — Phase 1 Week 4 Day 4.
+    # Pure-Python renderer (no cairo/pango system deps), safe to run in the
+    # same container as FastAPI without adding a native-code layer.
+    "reportlab>=4.2",
+
     # Misc
     "pydantic-settings>=2.3",
 ]

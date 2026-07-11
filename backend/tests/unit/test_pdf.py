@@ -100,15 +100,18 @@ def test_render_review_pdf_returns_valid_pdf_bytes():
 
 
 def test_render_pdf_includes_project_name_and_summary():
-    """Content sanity — the project name + summary text land in the PDF stream."""
+    """Content sanity — the project name + summary text land in the PDF stream.
+
+    Compression is off for this assertion so latin-1 decoding hits the raw
+    paragraph streams. Production output stays compressed.
+    """
     pdf = render_review_pdf(
         review=_sample_review(),
         project=_sample_project(),
         commits=_sample_commits(),
         findings=_sample_findings(),
+        _compressed=False,
     )
-    # reportlab compresses streams by default — decode text with latin-1 so
-    # binary sections don't blow up, then just look for the substring.
     text = pdf.decode("latin-1", errors="ignore")
     assert "AI-Customer-Support-Service" in text
     # The summary text lives in one of the paragraph streams
@@ -124,6 +127,7 @@ def test_render_pdf_handles_review_without_findings():
         project=_sample_project(),
         commits=[],
         findings=[],
+        _compressed=False,
     )
     assert pdf.startswith(b"%PDF-")
     text = pdf.decode("latin-1", errors="ignore")

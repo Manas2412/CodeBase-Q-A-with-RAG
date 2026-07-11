@@ -124,7 +124,12 @@ def fake_conn() -> FakeConn:
 
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch, fake_conn: FakeConn) -> TestClient:
-    """TestClient wired to a FakePool that uses our FakeConn."""
+    """TestClient wired to a FakePool that uses our FakeConn.
+
+    Also logs in via the shared-password auth flow so the test's requests
+    carry a valid session cookie. Without this, every protected endpoint
+    would return 401 before the FakePool got a chance to answer.
+    """
     from app import main as main_module
 
     monkeypatch.setattr(main_module, "db_pool", FakePool(fake_conn))
@@ -136,9 +141,19 @@ def client(monkeypatch: pytest.MonkeyPatch, fake_conn: FakeConn) -> TestClient:
         yield
 
     monkeypatch.setattr(main_module, "lifespan", _noop_lifespan)
-    # TestClient runs lifespan by default; pass raise_server_exceptions=True
-    # so a server-side bug surfaces as a test failure not a 500.
-    return TestClient(app)
+
+    # Configure the auth backend with a known password + secret and log in
+    # so the TestClient's cookie jar has a valid session for every request
+    # the test then makes.
+    monkeypatch.setenv("DASHBOARD_PASSWORD", "test-pw")
+    monkeypatch.setenv("SESSION_SECRET", "test-secret-not-for-prod")
+
+    tc = TestClient(app)
+    login_resp = tc.post("/auth/login", json={"password": "test-pw"})
+    assert login_resp.status_code == 200, (
+        "Auth fixture login failed — check DASHBOARD_PASSWORD/SESSION_SECRET wiring"
+    )
+    return tc
 
 
 # ── Row factories ─────────────────────────────────────────────────────────
@@ -195,7 +210,13 @@ def _commit_row(sha: str = "c0ffee", branch: str = "main") -> FakeRecord:
     )
 
 
-def _finding_row(severity: str = "major", file_path: str = "foo.py") -> FakeRecord:
+def _finding_row(
+    severity: str = "major",
+    file_path: str = "foo.py",
+    *,
+    code_snippet: str | None = "+        cursor.execute(f\"SELECT * FROM t WHERE x = {x}\")",
+    suggested_code: str | None = "        cursor.execute(\"SELECT * FROM t WHERE x = %s\", (x,))",
+) -> FakeRecord:
     return FakeRecord(
         id=uuid.uuid4(),
         review_id=_review_id(),
@@ -208,6 +229,8 @@ def _finding_row(severity: str = "major", file_path: str = "foo.py") -> FakeReco
         message="potential SQL injection",
         suggestion="parameterise the query",
         rule_id="SEC-001",
+        code_snippet=code_snippet,
+        suggested_code=suggested_code,
     )
 
 
@@ -426,6 +449,39 @@ class TestListReviewFindings:
     def test_invalid_limit_returns_422(self, client: TestClient) -> None:
         r = client.get(f"/reviews/{_review_id()}/findings?limit=1000")
         assert r.status_code == 422  # max 500
+
+    def test_code_snippet_and_suggested_code_surface(
+        self, client: TestClient, fake_conn: FakeConn
+    ) -> None:
+        """Day-5 added two TEXT NULL columns. The API must expose both — null-safe."""
+        fake_conn.queue_fetchval(1)
+        fake_conn.queue_fetch([
+            _finding_row(
+                severity="critical",
+                code_snippet="+    eval(user_input)",
+                suggested_code="    # Don't eval untrusted input.",
+            ),
+            _finding_row(
+                severity="minor",
+                code_snippet=None,         # extractor couldn't map the line
+                suggested_code=None,       # LLM didn't propose code-as-fix
+            ),
+        ])
+        fake_conn.queue_fetchval(2)
+
+        r = client.get(f"/reviews/{_review_id()}/findings")
+        body = r.json()
+        assert body["findings"][0]["code_snippet"] == "+    eval(user_input)"
+        assert body["findings"][0]["suggested_code"] == "    # Don't eval untrusted input."
+        assert body["findings"][1]["code_snippet"] is None
+        assert body["findings"][1]["suggested_code"] is None
+        # SELECT clause must request the new columns
+        main = next(
+            q for kind, q, _ in fake_conn.queries
+            if kind == "fetch" and "FROM review_findings" in q
+        )
+        assert "f.code_snippet" in main
+        assert "f.suggested_code" in main
 
 
 # ── GET /projects/{id}/commits ────────────────────────────────────────────

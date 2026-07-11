@@ -42,6 +42,11 @@ dependencies = [
     # same container as FastAPI without adding a native-code layer.
     "reportlab>=4.2",
 
+    # Session cookie signing for starlette's SessionMiddleware (Phase 1 Day 5
+    # dashboard auth). Not pulled in transitively by starlette or fastapi —
+    # they import it lazily only when SessionMiddleware is instantiated.
+    "itsdangerous>=2.2",
+
     # Misc
     "pydantic-settings>=2.3",
 ]

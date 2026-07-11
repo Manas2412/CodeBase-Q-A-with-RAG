@@ -51,6 +51,10 @@ async function request(path, { method = "GET", body, headers } = {}) {
       "Content-Type": "application/json",
       ...(headers || {}),
     },
+    // Same-origin cookies (dev proxy + prod behind Caddy). Without this
+    // the session cookie doesn't ride on the request in some browser
+    // configurations.
+    credentials: "same-origin",
     body: body ? JSON.stringify(body) : undefined,
   });
 
@@ -76,6 +80,11 @@ function safeJson(text) {
 
 // ── Endpoints ─────────────────────────────────────────────────────────────
 export const api = {
+  // Auth
+  authMe: () => request("/auth/me"),
+  authLogin: (password) => request("/auth/login", { method: "POST", body: { password } }),
+  authLogout: () => request("/auth/logout", { method: "POST" }),
+
   // Projects
   listProjects: (params) => request(`/projects${qs(params)}`),
   getProject: (id) => request(`/projects/${id}`),

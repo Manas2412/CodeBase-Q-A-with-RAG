@@ -8,11 +8,13 @@ import asyncio
 import asyncpg
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.sessions import SessionMiddleware
 
+from app import auth
 from app.db.database import needs_ssl, register_jsonb_codecs
 from app.providers import (
     ProviderError,
@@ -60,13 +62,50 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# ── Session middleware ──────────────────────────────────────────────────
+# Signed cookies backed by SESSION_SECRET. Rotating the secret invalidates
+# every active session — the intended way to force logout across the team.
+# Falls back to a clearly-dev value if the env var isn't set so local
+# development doesn't break; production MUST set SESSION_SECRET.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv(auth.ENV_SESSION_SECRET, "dev-only-secret-change-me"),
+    session_cookie="codereview_session",
+    max_age=auth.SESSION_MAX_AGE_SECONDS,
+    # SameSite=Lax lets the cookie ride cross-origin GETs (fine for our
+    # same-origin dev proxy setup) but blocks third-party POSTs — CSRF
+    # coverage without a token layer.
+    same_site="lax",
+    # Set https_only=True in production — the dev server is plain HTTP.
+    https_only=os.getenv("SESSION_HTTPS_ONLY", "").lower() == "true",
+)
+
+# CORS — permissive in dev; production terminates via Caddy same-origin.
+# `allow_credentials=True` requires an explicit list, not "*". We derive
+# the allowlist from an env var so ops can add trusted hosts without a
+# code change.
+_cors_allow = [
+    o.strip()
+    for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_allow,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Global auth gate ────────────────────────────────────────────────────
+#
+# Attach `require_auth` as a router-level dependency below for every
+# protected route. Public paths (auth login/logout/me) skip it.
+#
+# We define it at module scope so the endpoints don't need to import
+# `auth` individually.
+_RequireAuth = Depends(auth.require_auth)
 
 
 # Request/response models
@@ -408,8 +447,48 @@ def _derive_name(url: str) -> str:
     return last[:-4] if last.endswith(".git") else last or url
 
 
+# ── Auth endpoints (public — no require_auth) ───────────────────────────
+class LoginRequest(BaseModel):
+    password: str
+
+
+class AuthStatus(BaseModel):
+    authenticated: bool
+    configured: bool
+
+
+@app.post("/auth/login", response_model=AuthStatus)
+async def login(body: LoginRequest, request: Request):
+    """Verify the shared password and set the session cookie.
+
+    Returns 401 on wrong password. A generic message — "Invalid password" —
+    same for missing/empty/wrong so we don't leak whether the env var is set.
+    """
+    if not auth.verify_password(body.password):
+        raise HTTPException(status_code=401, detail="Invalid password")
+    auth.sign_in(request)
+    return AuthStatus(authenticated=True, configured=auth.is_configured())
+
+
+@app.post("/auth/logout", response_model=AuthStatus)
+async def logout(request: Request):
+    """Clear the session cookie. Always 200, even if there was no session."""
+    auth.sign_out(request)
+    return AuthStatus(authenticated=False, configured=auth.is_configured())
+
+
+@app.get("/auth/me", response_model=AuthStatus)
+async def me(request: Request):
+    """Report the caller's auth state. The frontend calls this on mount
+    to decide whether to render the app or redirect to /login."""
+    return AuthStatus(
+        authenticated=auth.is_signed_in(request),
+        configured=auth.is_configured(),
+    )
+
+
 # Endpoints
-@app.post("/repos")
+@app.post("/repos", dependencies=[_RequireAuth])
 async def add_repo(body: AddRequest):
     """Onboard a repo. Returns immediately — indexing runs in the background.
 
@@ -444,7 +523,8 @@ async def add_repo(body: AddRequest):
     return {"repo_id": str(project_id), "status": "pending"}
 
 
-@app.post("/projects", response_model=CreateProjectResponse, status_code=201)
+@app.post("/projects", response_model=CreateProjectResponse, status_code=201,
+          dependencies=[_RequireAuth])
 async def create_project(body: CreateProjectRequest):
     """Wizard Screen 3 → Create. The visible bottom-of-wizard action.
 
@@ -554,7 +634,7 @@ async def create_project(body: CreateProjectRequest):
     )
 
 
-@app.get("/projects", response_model=ProjectListResponse)
+@app.get("/projects", response_model=ProjectListResponse, dependencies=[_RequireAuth])
 async def list_projects(
     limit: int = Query(50, ge=1, le=100, description="Max rows to return"),
     offset: int = Query(0, ge=0, description="Skip the first N rows"),
@@ -600,7 +680,7 @@ async def list_projects(
     )
 
 
-@app.get("/projects/{project_id}", response_model=ProjectOut)
+@app.get("/projects/{project_id}", response_model=ProjectOut, dependencies=[_RequireAuth])
 async def get_project(project_id: str):
     """Project detail by ID. 404 if not found."""
     try:
@@ -617,7 +697,7 @@ async def get_project(project_id: str):
     return _row_to_project(row)
 
 
-@app.get("/projects/{project_id}/index-status")
+@app.get("/projects/{project_id}/index-status", dependencies=[_RequireAuth])
 async def project_index_status_stream(project_id: str):
     """Live SSE stream of indexing progress for wizard Screen 4.
 
@@ -697,7 +777,7 @@ async def project_index_status_stream(project_id: str):
     )
 
 
-@app.post("/projects/probe", response_model=ProbeResponse)
+@app.post("/projects/probe", response_model=ProbeResponse, dependencies=[_RequireAuth])
 async def probe_project(body: ProbeRequest):
     """Wizard Screen 1 → Screen 2 — paste a URL, get the actual branches.
 
@@ -763,7 +843,8 @@ async def probe_project(body: ProbeRequest):
 #   • Counts come from COUNT(*) with the same WHERE clause as the SELECT —
 #     correct for any filter combination.
 
-@app.get("/projects/{project_id}/reviews", response_model=ReviewListResponse)
+@app.get("/projects/{project_id}/reviews", response_model=ReviewListResponse,
+         dependencies=[_RequireAuth])
 async def list_project_reviews(
     project_id: str,
     limit: int = Query(50, ge=1, le=100),
@@ -826,7 +907,7 @@ async def list_project_reviews(
     )
 
 
-@app.get("/reviews/{review_id}", response_model=ReviewDetail)
+@app.get("/reviews/{review_id}", response_model=ReviewDetail, dependencies=[_RequireAuth])
 async def get_review(review_id: str):
     """Single review with full `summary` blob + commit attribution.
 
@@ -872,7 +953,8 @@ async def get_review(review_id: str):
     )
 
 
-@app.get("/reviews/{review_id}/findings", response_model=FindingListResponse)
+@app.get("/reviews/{review_id}/findings", response_model=FindingListResponse,
+         dependencies=[_RequireAuth])
 async def list_review_findings(
     review_id: str,
     limit: int = Query(100, ge=1, le=500),
@@ -952,7 +1034,8 @@ async def list_review_findings(
     )
 
 
-@app.get("/projects/{project_id}/commits", response_model=CommitListResponse)
+@app.get("/projects/{project_id}/commits", response_model=CommitListResponse,
+         dependencies=[_RequireAuth])
 async def list_project_commits(
     project_id: str,
     limit: int = Query(100, ge=1, le=500),
@@ -1029,6 +1112,7 @@ async def list_project_commits(
 @app.get(
     "/projects/{project_id}/branch-events",
     response_model=BranchEventListResponse,
+    dependencies=[_RequireAuth],
 )
 async def list_project_branch_events(
     project_id: str,
@@ -1111,6 +1195,7 @@ async def list_project_branch_events(
 @app.post(
     "/branch-events/{event_id}/resolve",
     response_model=BranchEventOut,
+    dependencies=[_RequireAuth],
 )
 async def resolve_branch_event(event_id: str):
     """Mark a branch event as resolved (operator dismissal).
@@ -1151,7 +1236,7 @@ async def resolve_branch_event(event_id: str):
 # enough to matter, we push the render into a Celery task and return a
 # signed URL to the pre-rendered blob (post-Phase-1).
 
-@app.get("/reviews/{review_id}/pdf")
+@app.get("/reviews/{review_id}/pdf", dependencies=[_RequireAuth])
 async def get_review_pdf(review_id: str):
     """Serve the review as a PDF attachment.
 
@@ -1287,7 +1372,7 @@ async def get_review_pdf(review_id: str):
     )
 
 
-@app.get("/repos/{repo_id}/status")
+@app.get("/repos/{repo_id}/status", dependencies=[_RequireAuth])
 async def repo_status(repo_id: str):
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(

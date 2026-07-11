@@ -333,6 +333,7 @@ def render_review_pdf(
     project: dict,
     commits: Iterable[dict],
     findings: Iterable[dict],
+    _compressed: bool = True,
 ) -> bytes:
     """Render a review PDF from plain dicts.
 
@@ -348,6 +349,10 @@ def render_review_pdf(
         Empty → the section is omitted.
     findings
         List of FindingOut dicts. Rendered in the order given.
+    _compressed
+        Private toggle — default True (production output is compressed like
+        every well-behaved PDF). Tests pass False so grepping the raw bytes
+        for expected strings works without pulling pypdf into the test deps.
 
     Returns
     -------
@@ -364,6 +369,7 @@ def render_review_pdf(
         bottomMargin=0.75 * inch,
         title=f"Code review — {project.get('name', 'report')}",
         author="Code Review Agent",
+        pageCompression=1 if _compressed else 0,
     )
     styles = _build_styles()
 
